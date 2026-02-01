@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# FreqTrade specific
+config_secrets.json
+config.json.backup
+*.db
+*.sqlite
+*.log
+
+# User data (model'ler çok büyük)
+user_data/models/*
+!user_data/models/.gitkeep
+user_data/logs/*
+!user_data/logs/.gitkeep
+user_data/backtest_results/*
+!user_data/backtest_results/.gitkeep
+user_data/hyperopt_results/*
+!user_data/hyperopt_results/.gitkeep
+
+# Data files
+*.feather
+*.parquet
+*.csv
+*.h5
+*.hdf5
+
+# Plots
+plots/
+user_data/plot/*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker
+.dockerignore
+
+# Logs
+logs/
+*.log
+
+# API Keys & Secrets
+*secret*
+*apikey*
+*api_key*
+*.pem
+*.key
+
+# Binance data cache
+user_data/data/binance/
+cointegration_results_*.csv

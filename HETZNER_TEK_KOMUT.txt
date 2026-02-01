@@ -1,0 +1,1 @@
+cd /root && apt update && apt install -y docker.io docker-compose git curl && systemctl start docker && systemctl enable docker && git clone https://github.com/furkntrg41/trade_Bot.git && cd trade_Bot && echo '{"exchange":{"key":"BURAYA_API_KEY","secret":"BURAYA_API_SECRET"}}' > config_secrets.json && chmod 600 config_secrets.json && docker-compose up -d && docker-compose logs -f

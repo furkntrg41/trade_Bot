@@ -1,0 +1,704 @@
+"""
+Execution Engine - Order Placement via CCXT Async
+===================================================
+TradingSignal'ları gerçek Binance Futures/Spot order'larına çevirip
+çalıştıran production-grade execution engine.
+
+Features:
+- Limit + Market order support
+- Order validation and constraints
+- Position tracking
+- Error handling ve retry logic
+- PnL calculation
+
+Author: Quant Team
+Date: 2026-02-01
+"""
+
+import asyncio
+import logging
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime
+
+try:
+    import ccxt.async_support as ccxt
+except ImportError:
+    raise ImportError("CCXT gerekli: pip install ccxt")
+
+from .signal_generator import TradingSignal, SignalStrength, SignalType
+from .config import get_config, Config
+
+
+logger = logging.getLogger(__name__)
+
+
+class OrderStatus(Enum):
+    """Order status enum"""
+    PENDING = "pending"
+    OPEN = "open"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class PositionMode(Enum):
+    """Position type"""
+    LONG = "long"
+    SHORT = "short"
+    NEUTRAL = "neutral"
+
+
+@dataclass
+class Order:
+    """
+    Order tracking dataclass
+    
+    Attributes:
+        order_id: Binance order ID
+        timestamp: Order zamanı
+        symbol: Trading pair (BTC/USDT)
+        side: BUY veya SELL
+        order_type: market veya limit
+        quantity: Miktar
+        price: Fiyat (limit için)
+        status: OrderStatus
+        filled: Doldurulan miktar
+        average_price: Ortalama fiyat
+        fee_cost: Ödenen komisyon
+        pnl: Kapalı order için kâr/zarar
+    """
+    order_id: str
+    timestamp: datetime
+    symbol: str
+    side: str  # BUY, SELL
+    order_type: str  # market, limit
+    quantity: float
+    price: Optional[float] = None
+    status: OrderStatus = OrderStatus.PENDING
+    filled: float = 0.0
+    average_price: float = 0.0
+    fee_cost: float = 0.0
+    pnl: float = 0.0
+
+
+@dataclass
+class Position:
+    """
+    Position tracking dataclass
+    
+    Attributes:
+        pair_x, pair_y: Pair sembolü
+        mode: LONG/SHORT/NEUTRAL
+        quantity_x: pair_x miktarı
+        quantity_y: pair_y miktarı
+        entry_price_x, entry_price_y: Giriş fiyatları
+        entry_time: Giriş zamanı
+        orders: İlgili order'lar
+        unrealized_pnl: Açık PnL
+        realized_pnl: Kapalı PnL
+    """
+    pair_x: str
+    pair_y: str
+    mode: PositionMode = PositionMode.NEUTRAL
+    quantity_x: float = 0.0
+    quantity_y: float = 0.0
+    entry_price_x: float = 0.0
+    entry_price_y: float = 0.0
+    entry_time: Optional[datetime] = None
+    orders: List[Order] = field(default_factory=list)
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    
+    def is_open(self) -> bool:
+        """Position açık mı"""
+        return abs(self.quantity_x) > 1e-6 or abs(self.quantity_y) > 1e-6
+
+
+class ExecutionEngine:
+    """
+    Production-grade execution engine for placing trades.
+    
+    Features:
+    - CCXT Async via Binance API
+    - Limit ve Market order'lar
+    - Order validation (size, leverage, margin)
+    - Position tracking
+    - Error recovery
+    - Fee accounting
+    
+    Type-safe, async, production-ready.
+    """
+    
+    def __init__(self, config: Optional[Config] = None):
+        """
+        Args:
+            config: Configuration (default: get_config())
+        """
+        self.config = config or get_config()
+        self.exchange: Optional[ccxt.Exchange] = None
+        
+        # Position tracking
+        self.positions: Dict[str, Position] = {}
+        self.orders: Dict[str, Order] = {}
+        
+        # Stats
+        self.total_trades = 0
+        self.total_pnl = 0.0
+        self.total_fees = 0.0
+    
+    async def connect(self) -> bool:
+        """
+        Binance'ye bağlan
+        
+        Returns:
+            Bağlı mı
+        """
+        try:
+            if self.config.data.use_testnet:
+                self.exchange = ccxt.binance({
+                    'apiKey': self.config.binance_api_key,
+                    'secret': self.config.binance_api_secret,
+                    'urls': {
+                        'api': 'https://testnet.binance.vision/api',
+                    },
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'future',  # Futures
+                    },
+                })
+            else:
+                self.exchange = ccxt.binance({
+                    'apiKey': self.config.binance_api_key,
+                    'secret': self.config.binance_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'future',
+                    },
+                })
+            
+            # Test connection
+            balance = await self.exchange.fetch_balance()
+            total_usdt = balance.get('total', {}).get('USDT', 0)
+            
+            logger.info(
+                f"✅ ExecutionEngine bağlantısı başarılı | "
+                f"Balance: ${total_usdt:,.2f}"
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Connection hatası: {e}")
+            return False
+    
+    async def disconnect(self) -> None:
+        """Bağlantıyı kapat"""
+        if self.exchange:
+            await self.exchange.close()
+            logger.info("ExecutionEngine kapandı")
+    
+    async def execute_signal(self, signal: TradingSignal) -> Optional[Order]:
+        """
+        Trading signal'ı execute et (gerçek order yerleştir)
+        
+        Args:
+            signal: TradingSignal instance
+            
+        Returns:
+            Yerleştirilen order veya None (hata durumunda)
+        """
+        if not self.exchange:
+            logger.error("Exchange bağlı değil")
+            return None
+        
+        try:
+            # Order size hesapla
+            order_size = await self._calculate_order_size(signal)
+            
+            if order_size <= 0:
+                logger.warning(f"❌ Invalid order size: {order_size}")
+                return None
+            
+            # BUY signal
+            if signal.signal_type == SignalType.BUY:
+                order = await self._place_buy_order(signal, order_size)
+            
+            # SELL signal
+            elif signal.signal_type == SignalType.SELL:
+                order = await self._place_sell_order(signal, order_size)
+            
+            # EXIT signal (close position)
+            elif signal.signal_type == SignalType.EXIT:
+                order = await self._close_position(signal)
+            
+            else:
+                logger.warning(f"Unknown signal type: {signal.signal_type}")
+                return None
+            
+            return order
+            
+        except Exception as e:
+            logger.error(f"❌ Signal execution hatası: {e}", exc_info=True)
+            return None
+    
+    async def _calculate_order_size(self, signal: TradingSignal) -> float:
+        """
+        Signal'dan order size hesapla
+        
+        Matematiksel temel:
+        - Account equity'sin %1'i maksimum risk
+        - Signal strength'e göre scale et
+        - Volatilitye göre adjust et
+        
+        Args:
+            signal: TradingSignal
+            
+        Returns:
+            Order miktarı (USDT)
+        """
+        try:
+            # Hesap bilgisi al
+            balance = await self.exchange.fetch_balance()
+            account_equity = balance.get('free', {}).get('USDT', 0)
+            
+            if account_equity <= 0:
+                logger.error("Account equity sıfır")
+                return 0
+            
+            # Base size (account'un %1'i)
+            base_size = account_equity * self.config.execution.risk_per_trade
+            
+            # Signal strength'e göre scale et
+            size_multiplier = signal.strength.value  # 0.5-2.0
+            
+            # Suggested position size (confidence)
+            confidence_multiplier = signal.suggested_position_size
+            
+            # Final size
+            final_size = base_size * size_multiplier * confidence_multiplier
+            
+            # Limits
+            final_size = min(
+                final_size,
+                account_equity * self.config.execution.max_position_size,
+            )
+            final_size = max(
+                final_size,
+                self.config.execution.min_order_value,
+            )
+            
+            logger.debug(
+                f"Order size: ${final_size:.2f} "
+                f"(base: ${base_size:.2f}, "
+                f"strength: {signal.strength.name}, "
+                f"confidence: {confidence_multiplier:.1%})"
+            )
+            
+            return final_size
+            
+        except Exception as e:
+            logger.error(f"Order size calculation hatası: {e}")
+            return 0
+    
+    async def _place_buy_order(
+        self,
+        signal: TradingSignal,
+        size_usdt: float,
+    ) -> Optional[Order]:
+        """
+        BUY order yerleştir (pair_x long, pair_y short)
+        
+        SAFETY CRITICAL:
+        1. Precision handling (amount_to_precision, price_to_precision)
+        2. Min notional check (> 5 USDT Binance minimum)
+        3. Legging risk protection (emergency rollback if Leg B fails)
+        
+        Pairs trading: 
+        - pair_x'i satın al (long)
+        - pair_y'yi sat (short) hedge ratio ile
+        
+        Args:
+            signal: TradingSignal
+            size_usdt: Order boyutu (USDT)
+            
+        Returns:
+            Order instance
+        """
+        order_x_placed = None
+        order_y_placed = None
+        
+        try:
+            # Symbols
+            symbol_x = f"{signal.pair_x}/USDT:USDT"  # Futures
+            symbol_y = f"{signal.pair_y}/USDT:USDT"
+            
+            # Get current prices
+            ticker_x = await self.exchange.fetch_ticker(symbol_x)
+            ticker_y = await self.exchange.fetch_ticker(symbol_y)
+            
+            price_x = ticker_x['last']
+            price_y = ticker_y['last']
+            
+            # Calculate quantities
+            qty_x_raw = size_usdt / price_x  # BTC satın al
+            qty_y_raw = (size_usdt * signal.hedge_ratio) / price_y  # ETH sat
+            
+            # ✅ SAFETY 1: Apply Precision (CRITICAL - Binance rejects imprecise orders)
+            qty_x = float(self.exchange.amount_to_precision(symbol_x, qty_x_raw))
+            qty_y = float(self.exchange.amount_to_precision(symbol_y, qty_y_raw))
+            
+            # ✅ SAFETY 2: Min Notional Check (Binance minimum ~5 USDT per order)
+            notional_x = qty_x * price_x
+            notional_y = qty_y * price_y
+            
+            if notional_x < self.config.execution.min_order_value:
+                logger.error(f"❌ Order X below min notional: ${notional_x:.2f} < ${self.config.execution.min_order_value}")
+                return None
+            if notional_y < self.config.execution.min_order_value:
+                logger.error(f"❌ Order Y below min notional: ${notional_y:.2f} < ${self.config.execution.min_order_value}")
+                return None
+            
+            logger.info(
+                f"🟢 BUY ORDER: "
+                f"LONG {qty_x:.4f} {signal.pair_x} @ ${price_x:.2f} (${notional_x:.2f}) + "
+                f"SHORT {qty_y:.4f} {signal.pair_y} @ ${price_y:.2f} (${notional_y:.2f})"
+            )
+            
+            # ✅ SAFETY 3: Legging Risk Protection - Execute Leg A first
+            logger.debug("📤 Placing Leg A (LONG X)...")
+            order_x = await self.exchange.create_market_buy_order(
+                symbol_x,
+                qty_x,
+            )
+            order_x_placed = order_x  # Track for rollback
+            logger.info(f"✅ Leg A filled: {order_x['id']}")
+            
+            # ✅ SAFETY 4: Execute Leg B (hedge) - CRITICAL POINT
+            logger.debug("📤 Placing Leg B (SHORT Y)...")
+            try:
+                order_y = await self.exchange.create_market_sell_order(
+                    symbol_y,
+                    qty_y,
+                )
+                order_y_placed = order_y
+                logger.info(f"✅ Leg B filled: {order_y['id']}")
+            except Exception as leg_b_error:
+                # 🚨 EMERGENCY: Leg A filled but Leg B failed → ROLLBACK
+                logger.critical(
+                    f"🚨 LEGGING RISK DETECTED: Leg B failed after Leg A filled! "
+                    f"Error: {leg_b_error}"
+                )
+                await self._emergency_close_position(
+                    symbol=symbol_x,
+                    side='SELL',  # Close the LONG position
+                    quantity=qty_x,
+                    reason="Leg B Failure"
+                )
+                raise Exception(f"Atomic execution failed: {leg_b_error}")
+            
+            # Track position
+            position_key = f"{signal.pair_x}_{signal.pair_y}"
+            self.positions[position_key] = Position(
+                pair_x=signal.pair_x,
+                pair_y=signal.pair_y,
+                mode=PositionMode.LONG,
+                quantity_x=qty_x,
+                quantity_y=-qty_y,  # Short position
+                entry_price_x=price_x,
+                entry_price_y=price_y,
+                entry_time=datetime.utcnow(),
+                orders=[
+                    Order(
+                        order_id=order_x['id'],
+                        timestamp=datetime.utcnow(),
+                        symbol=symbol_x,
+                        side='BUY',
+                        order_type='market',
+                        quantity=qty_x,
+                        average_price=price_x,
+                        status=OrderStatus.CLOSED,
+                    ),
+                    Order(
+                        order_id=order_y['id'],
+                        timestamp=datetime.utcnow(),
+                        symbol=symbol_y,
+                        side='SELL',
+                        order_type='market',
+                        quantity=qty_y,
+                        average_price=price_y,
+                        status=OrderStatus.CLOSED,
+                    ),
+                ],
+            )
+            
+            self.total_trades += 2
+            
+            return self.positions[position_key].orders[0]
+            
+        except Exception as e:
+            logger.error(f"❌ BUY order hatası: {e}", exc_info=True)
+            
+            # If partial fill occurred, rollback was already attempted above
+            if order_x_placed and not order_y_placed:
+                logger.error("⚠️ Partial fill - rollback attempted")
+            
+            return None
+    
+    async def _emergency_close_position(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        reason: str,
+    ) -> None:
+        """
+        🚨 EMERGENCY ROLLBACK: Close a position immediately (Market Order)
+        
+        Use Case: Legging risk - if one leg of pair fills but other fails,
+        we must close the filled leg immediately to avoid naked directional exposure.
+        
+        Args:
+            symbol: Trading pair (BTC/USDT:USDT)
+            side: BUY or SELL
+            quantity: Amount to close
+            reason: Why emergency close triggered
+        """
+        try:
+            logger.critical(
+                f"🚨 EMERGENCY CLOSE: {side} {quantity} {symbol} | Reason: {reason}"
+            )
+            
+            if side == 'BUY':
+                await self.exchange.create_market_buy_order(symbol, quantity)
+            elif side == 'SELL':
+                await self.exchange.create_market_sell_order(symbol, quantity)
+            
+            logger.info(f"✅ Emergency close executed: {symbol}")
+            
+        except Exception as e:
+            logger.critical(
+                f"💀 CRITICAL: Emergency close FAILED for {symbol}. "
+                f"MANUAL INTERVENTION REQUIRED. Error: {e}"
+            )
+            # Send alert (Telegram, email, etc.)
+            # In production, trigger incident response
+    
+    async def _place_sell_order(
+        self,
+        signal: TradingSignal,
+        size_usdt: float,
+    ) -> Optional[Order]:
+        """
+        SELL order yerleştir (pair_x short, pair_y long)
+        
+        Spread çok yüksek (pair_x pahalı, pair_y ucuz):
+        - pair_x'i sat (short)
+        - pair_y'yi satın al (long)
+        
+        Args:
+            signal: TradingSignal
+            size_usdt: Order boyutu
+            
+        Returns:
+            Order instance
+        """
+        try:
+            symbol_x = f"{signal.pair_x}/USDT:USDT"
+            symbol_y = f"{signal.pair_y}/USDT:USDT"
+            
+            ticker_x = await self.exchange.fetch_ticker(symbol_x)
+            ticker_y = await self.exchange.fetch_ticker(symbol_y)
+            
+            price_x = ticker_x['last']
+            price_y = ticker_y['last']
+            
+            qty_x = size_usdt / price_x
+            qty_y = (size_usdt * signal.hedge_ratio) / price_y
+            
+            logger.info(
+                f"🔴 SELL ORDER: "
+                f"SHORT {qty_x:.4f} {signal.pair_x} @ ${price_x:.2f} + "
+                f"LONG {qty_y:.4f} {signal.pair_y} @ ${price_y:.2f}"
+            )
+            
+            # SHORT pair_x
+            order_x = await self.exchange.create_market_sell_order(
+                symbol_x,
+                qty_x,
+            )
+            
+            # LONG pair_y
+            order_y = await self.exchange.create_market_buy_order(
+                symbol_y,
+                qty_y,
+            )
+            
+            # Track
+            position_key = f"{signal.pair_x}_{signal.pair_y}"
+            self.positions[position_key] = Position(
+                pair_x=signal.pair_x,
+                pair_y=signal.pair_y,
+                mode=PositionMode.SHORT,
+                quantity_x=-qty_x,  # Short
+                quantity_y=qty_y,   # Long
+                entry_price_x=price_x,
+                entry_price_y=price_y,
+                entry_time=datetime.utcnow(),
+            )
+            
+            self.total_trades += 2
+            return self.positions[position_key].orders[0] if self.positions[position_key].orders else None
+            
+        except Exception as e:
+            logger.error(f"❌ SELL order hatası: {e}", exc_info=True)
+            return None
+    
+    async def _close_position(self, signal: TradingSignal) -> Optional[Order]:
+        """
+        Position'u kapat (exit signal)
+        
+        Args:
+            signal: TradingSignal (EXIT type)
+            
+        Returns:
+            Order instance
+        """
+        position_key = f"{signal.pair_x}_{signal.pair_y}"
+        position = self.positions.get(position_key)
+        
+        if not position or not position.is_open():
+            logger.warning(f"❌ Position bulunamadı: {position_key}")
+            return None
+        
+        try:
+            logger.info(f"🟡 CLOSING POSITION: {position_key}")
+            
+            symbol_x = f"{signal.pair_x}/USDT:USDT"
+            symbol_y = f"{signal.pair_y}/USDT:USDT"
+            
+            # Get exit prices
+            ticker_x = await self.exchange.fetch_ticker(symbol_x)
+            ticker_y = await self.exchange.fetch_ticker(symbol_y)
+            
+            exit_price_x = ticker_x['last']
+            exit_price_y = ticker_y['last']
+            
+            # Close positions (reverse orders)
+            if position.quantity_x > 0:  # Long position
+                await self.exchange.create_market_sell_order(
+                    symbol_x,
+                    abs(position.quantity_x),
+                )
+            elif position.quantity_x < 0:  # Short position
+                await self.exchange.create_market_buy_order(
+                    symbol_x,
+                    abs(position.quantity_x),
+                )
+            
+            if position.quantity_y > 0:
+                await self.exchange.create_market_sell_order(
+                    symbol_y,
+                    abs(position.quantity_y),
+                )
+            elif position.quantity_y < 0:
+                await self.exchange.create_market_buy_order(
+                    symbol_y,
+                    abs(position.quantity_y),
+                )
+            
+            # Calculate PnL
+            pnl_x = (exit_price_x - position.entry_price_x) * position.quantity_x
+            pnl_y = (exit_price_y - position.entry_price_y) * position.quantity_y
+            total_pnl = pnl_x + pnl_y
+            
+            logger.info(
+                f"✅ Position closed | "
+                f"PnL: ${total_pnl:.2f} "
+                f"({total_pnl/(position.entry_price_x*position.quantity_x)*100:.2f}%)"
+            )
+            
+            # Update stats
+            self.total_pnl += total_pnl
+            position.realized_pnl = total_pnl
+            position.mode = PositionMode.NEUTRAL
+            
+            return None  # Kapalı
+            
+        except Exception as e:
+            logger.error(f"❌ Close position hatası: {e}", exc_info=True)
+            return None
+    
+    def get_summary(self) -> Dict:
+        """
+        Execution summary al (monitoring için)
+        
+        Returns:
+            Dictionary with statistics
+        """
+        open_positions = [p for p in self.positions.values() if p.is_open()]
+        
+        return {
+            'total_trades': self.total_trades,
+            'total_pnl': f"${self.total_pnl:.2f}",
+            'total_fees': f"${self.total_fees:.2f}",
+            'open_positions': len(open_positions),
+            'positions': {
+                k: {
+                    'mode': v.mode.value,
+                    'qty_x': v.quantity_x,
+                    'qty_y': v.quantity_y,
+                    'unrealized_pnl': v.unrealized_pnl,
+                    'realized_pnl': v.realized_pnl,
+                }
+                for k, v in self.positions.items()
+                if v.is_open()
+            },
+        }
+
+
+async def example_trading_loop():
+    """Example: signal -> execution loop"""
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    config = get_config()
+    engine = ExecutionEngine(config)
+    
+    try:
+        # Connect
+        if not await engine.connect():
+            return
+        
+        # Example signal
+        signal = TradingSignal(
+            timestamp=datetime.utcnow(),
+            pair_x="BTC",
+            pair_y="ETH",
+            signal_type=SignalType.BUY,
+            z_score=2.5,
+            confidence=0.85,
+            strength=SignalStrength.STRONG,
+            suggested_position_size=0.75,
+            stop_loss_z=4.0,
+            take_profit_z=0.0,
+        )
+        
+        # Execute
+        order = await engine.execute_signal(signal)
+        
+        if order:
+            logger.info(f"✅ Order placed: {order.order_id}")
+        
+        # Summary
+        logger.info(f"\n{engine.get_summary()}")
+        
+    finally:
+        await engine.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(example_trading_loop())

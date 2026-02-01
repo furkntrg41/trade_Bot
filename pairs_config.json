@@ -1,0 +1,94 @@
+{
+  "pairs": [
+    {
+      "pair_id": "1000CAT_1MBABYDOGE",
+      "leg_a": "1000CAT/USDT",
+      "leg_b": "1MBABYDOGE/USDT",
+      "hedge_ratio": 0.7387,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 5
+    },
+    {
+      "pair_id": "1INCH_AI",
+      "leg_a": "1INCH/USDT",
+      "leg_b": "AI/USDT",
+      "hedge_ratio": 1.0802,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 4
+    },
+    {
+      "pair_id": "1000CAT_AIXBT",
+      "leg_a": "1000CAT/USDT",
+      "leg_b": "AIXBT/USDT",
+      "hedge_ratio": 0.9429,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 8
+    },
+    {
+      "pair_id": "1MBABYDOGE_AEVO",
+      "leg_a": "1MBABYDOGE/USDT",
+      "leg_b": "AEVO/USDT",
+      "hedge_ratio": 1.048,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 5
+    },
+    {
+      "pair_id": "AI_ALGO",
+      "leg_a": "AI/USDT",
+      "leg_b": "ALGO/USDT",
+      "hedge_ratio": 0.7077,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 5
+    },
+    {
+      "pair_id": "AAVE_AI",
+      "leg_a": "AAVE/USDT",
+      "leg_b": "AI/USDT",
+      "hedge_ratio": 1.4681,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 5
+    },
+    {
+      "pair_id": "AIXBT_ALICE",
+      "leg_a": "AIXBT/USDT",
+      "leg_b": "ALICE/USDT",
+      "hedge_ratio": 0.9236,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 9
+    },
+    {
+      "pair_id": "1MBABYDOGE_ADA",
+      "leg_a": "1MBABYDOGE/USDT",
+      "leg_b": "ADA/USDT",
+      "hedge_ratio": 0.516,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 17
+    },
+    {
+      "pair_id": "ACE_ALT",
+      "leg_a": "ACE/USDT",
+      "leg_b": "ALT/USDT",
+      "hedge_ratio": 0.774,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 5
+    },
+    {
+      "pair_id": "1000SATS_AEVO",
+      "leg_a": "1000SATS/USDT",
+      "leg_b": "AEVO/USDT",
+      "hedge_ratio": 0.9661,
+      "z_score_threshold": 2.0,
+      "stop_loss_z": 4.0,
+      "half_life_candles": 6
+    }
+  ]
+}

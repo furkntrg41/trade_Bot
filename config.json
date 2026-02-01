@@ -17,8 +17,8 @@
     
     "exchange": {
         "name": "binance",
-        "key": "",
-        "secret": "",
+        "key": "test_api_key_paper_trading",
+        "secret": "test_api_secret_paper_trading",
         "ccxt_config": {
             "enableRateLimit": true,
             "options": {
