@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  freqtrade:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: freqtrade_bot
+    restart: always
+    
+    # 7/24 Çalışma için Ayarlar
+    environment:
+      - TZ=UTC
+      - LOG_LEVEL=INFO
+    
+    # DNS Çözümü
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    
+    # Volumes: persistent data, model'ler, loglar
+    volumes:
+      - ./user_data:/freqtrade/user_data
+      - ./config.json:/freqtrade/config.json
+    
+    # Port ayarları
+    ports:
+      - "0.0.0.0:8080:8080"  # Tüm IP'lerden erişim (reverse proxy arkasında güvenli)
+    
+    # Resource Limits (VPS: 4GB RAM)
+    deploy:
+      resources:
+        limits:
+          memory: 3500M
+        reservations:
+          memory: 2G
+    
+    # Health check - container'ın canlı olup olmadığını kontrol et
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/ping || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    
+    # Loglar konsola yazılsın (docker logs ile görebilmek için)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Container başladığında çalışacak komut
+    command: >
+      trade
+      --config /freqtrade/config.json
+      --strategy FreqaiExampleStrategy
+      --freqaimodel LightGBMRegressor
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+
+  # FreqUI - Web Dashboard
+  # NOT: freqtradeorg/frequi artık deprecated. API server üzerinden erişilecek.
+  # frequi:
+  #   image: freqtradeorg/frequi:latest
+  #   container_name: frequi
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8081:80"
+  #   depends_on:
+  #     - freqtrade

@@ -1,0 +1,1 @@
+{"BTC/USDT:USDT":{"model_filename":"cb_btc_1769704786","trained_timestamp":1769704786,"data_path":"/freqtrade/user_data/models/freqai_lightgbm_futures/sub-train-BTC_1769704786","extras":{}},"ETH/USDT:USDT":{"model_filename":"cb_eth_1769704878","trained_timestamp":1769704878,"data_path":"/freqtrade/user_data/models/freqai_lightgbm_futures/sub-train-ETH_1769704878","extras":{}}}

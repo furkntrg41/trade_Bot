@@ -1,0 +1,157 @@
+{
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    
+    "max_open_trades": 2,
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "max_stake_amount": 150,
+    "position_stacking": false,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    
+    "cancel_open_orders_on_exit": true,
+    
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {
+            "enableRateLimit": true,
+            "options": {
+                "defaultType": "future"
+            }
+        },
+        "ccxt_async_config": {
+            "enableRateLimit": true
+        },
+        "pair_whitelist": [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT"
+        ],
+        "pair_blacklist": [
+            "BNB/.*"
+        ]
+    },
+    
+    "entry_pricing": {
+        "price_side": "other",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+    
+    "exit_pricing": {
+        "price_side": "other",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    
+    "order_types": {
+        "entry": "limit",
+        "exit": "limit",
+        "emergency_exit": "market",
+        "force_entry": "market",
+        "force_exit": "market",
+        "stoploss": "market",
+        "stoploss_on_exchange": true,
+        "stoploss_on_exchange_interval": 60
+    },
+    
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    
+    "freqai": {
+        "enabled": true,
+        "purge_old_models": 2,
+        "train_period_days": 45,
+        "backtest_period_days": 10,
+        "identifier": "freqai_lightgbm_futures",
+        
+        "live_retrain_hours": 2,
+        "expiration_hours": 4,
+        "fit_live_predictions_candles": 100,
+        
+        "feature_parameters": {
+            "include_corr_pairlist": [],
+            "include_timeframes": [
+                "5m",
+                "15m",
+                "1h"
+            ],
+            "label_period_candles": 20,
+            "include_shifted_candles": 3,
+            "DI_threshold": 8,
+            "weight_factor": 0.9,
+            "indicator_periods_candles": [10, 20, 40, 100]
+        },
+        
+        "data_split_parameters": {
+            "test_size": 0.25,
+            "random_state": 42,
+            "shuffle": false
+        },
+        
+        "model_training_parameters": {
+            "n_estimators": 600,
+            "learning_rate": 0.01,
+            "max_depth": 8,
+            "num_leaves": 48,
+            "min_child_samples": 30,
+            "n_jobs": 2,
+            "verbosity": -1
+        }
+    },
+    
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8080,
+        "verbosity": "info",
+        "enable_openapi": true,
+        "jwt_secret_key": "af2e5f6f185f1d64df91264a463266219e02cb495167b8900cdb5271316ee97e",
+        "ws_token": "ws_af2e5f6f185f1d64df91264a463266219e02cb49",
+        "CORS_origins": ["http://localhost:8081"],
+        "username": "freqtrader",
+        "password": "furkan123"
+    },
+    
+    "bot_name": "FreqAI_Futures_Bot",
+    "initial_state": "running",
+    
+    "force_entry_enable": true,
+    
+    "internals": {
+        "process_throttle_secs": 5
+    },
+    
+    "telegram": {
+        "enabled": true,
+        "token": "8505650305:AAGTtcvFjJA3Lal5AeDXS4KovLddQg2QDsI",
+        "chat_id": "5165797252",
+        "notification_settings": {
+            "status": "on",
+            "warning": "on",
+            "startup": "on",
+            "entry": "on",
+            "entry_fill": "on",
+            "entry_cancel": "on",
+            "exit": "on",
+            "exit_fill": "on",
+            "exit_cancel": "on",
+            "protection_trigger": "on",
+            "protection_trigger_global": "on",
+            "strategy_msg": "on"
+        }
+    }
+}
