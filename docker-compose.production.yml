@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  freqtrade:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: freqtrade_bot
+    
+    # Auto-recovery: restart unless explicitly stopped
+    restart: unless-stopped
+    
+    # Production environment
+    environment:
+      - TZ=UTC
+      - LOG_LEVEL=INFO
+      - PYTHONUNBUFFERED=1
+    
+    # Load sensitive keys from .env file
+    env_file:
+      - .env.production
+    
+    # DNS resolution for stable connections
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    
+    # Persistent volumes for crash recovery
+    volumes:
+      - ./user_data:/freqtrade/user_data
+      - ./config.json:/freqtrade/config.json:ro
+      - ./pairs_config.json:/freqtrade/pairs_config.json:ro
+      - ./logs:/freqtrade/logs
+      - ./scripts:/freqtrade/scripts:ro
+    
+    # REST API endpoint (port 8080)
+    ports:
+      - "0.0.0.0:8080:8080"
+    
+    # Resource limits (Hetzner CPX22: 4 GB RAM)
+    deploy:
+      resources:
+        limits:
+          memory: 3500M
+        reservations:
+          memory: 2500M
+    
+    # Health monitoring: checks API /ping endpoint every 60s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/ping || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    
+    # Log rotation and aggregation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service=freqtrade,environment=production"
+    
+    # Startup command with crash recovery + state reconciliation
+    command: >
+      sh -c "
+      echo '[STATE RECOVERY] Starting reconciliation...' &&
+      python3 /freqtrade/scripts/state_recovery.py &&
+      echo '[LAUNCH] Starting FreqTrade bot...' &&
+      freqtrade trade
+      --config /freqtrade/config.json
+      --strategy FreqaiExampleStrategy
+      --freqaimodel LightGBMRegressor
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      "
+    
+    # Graceful shutdown (30s timeout)
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
