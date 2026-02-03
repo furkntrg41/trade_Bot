@@ -1,0 +1,46 @@
+# Configuration-Driven Provider System (OCP Compliance)
+# Add/remove providers WITHOUT touching code
+
+sentiment_providers:
+  - name: "cryptopanic"
+    class: "CryptoPanicSentimentProvider"
+    enabled: true
+    config:
+      cache_ttl: 43200  # 12 hours
+      api_key_env: "CRYPTOPANIC_API_KEY"
+      
+  - name: "coingecko"
+    class: "CoinGeckoSentimentProvider"
+    enabled: true
+    config:
+      cache_ttl: 3600  # 1 hour
+      
+  # NEW PROVIDER: Add without code change (OCP)
+  - name: "twitter_sentiment"
+    class: "TwitterSentimentProvider"
+    enabled: false  # Disabled for now
+    config:
+      cache_ttl: 1800
+      api_key_env: "TWITTER_BEARER_TOKEN"
+
+market_data_providers:
+  - name: "binance"
+    class: "BinanceMarketDataProvider"
+    enabled: true
+    config:
+      cache_ttl: 1800
+      
+cointegration_algorithms:
+  - name: "engle_granger"
+    class: "EngleGrangerCointegration"
+    enabled: true
+    config:
+      lookback_period: 252
+      p_value_threshold: 0.05
+      
+  # Alternative algorithms (swappable via config)
+  - name: "johansen"
+    class: "JohansenCointegration"
+    enabled: false
+    config:
+      lookback_period: 252

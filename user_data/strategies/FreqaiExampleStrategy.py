@@ -37,7 +37,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from application.service_container import ServiceContainer
+# REFACTORED: Dynamic config-driven container (OCP compliance)
+from application.dynamic_service_container import DynamicServiceContainer
 
 # Statsmodels availability check
 try:
@@ -71,14 +72,17 @@ class FreqaiExampleStrategy(IStrategy):
     def __init__(self, config: dict) -> None:
         super().__init__(config)
         
-        # Dependency injection (IoC container)
-        self._container = ServiceContainer()
+        # REFACTORED: Dynamic config-driven container (OCP compliance)
+        # Add/remove providers in YAML - NO code modification
+        self._container = DynamicServiceContainer()
         
         # Injected services (DIP: depend on abstractions)
         self._cointegration_service = self._container.cointegration_service
         self._sentiment_aggregator = self._container.sentiment_aggregator
         self._market_data_provider = self._container.market_data_provider
         self._cache_service = self._container.cache_service
+        
+        logger.info(f"✅ Strategy initialized with providers: {self._container.get_provider_stats()}")
     
     # ROI: Fibonacci-based, momentum decay
     # Based on: Price Action candle expansion patterns

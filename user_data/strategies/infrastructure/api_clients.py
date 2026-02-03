@@ -2,6 +2,8 @@
 Infrastructure Layer - External API Clients
 ===========================================
 Concrete implementations of domain interfaces (DIP compliance)
+
+AUTO-REGISTRATION: Providers register themselves (OCP via Registry Pattern)
 """
 import logging
 import time
@@ -11,6 +13,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.interfaces import ISentimentProvider, IMarketDataProvider, SentimentData
+from core.provider_registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +27,22 @@ except ImportError:
 class CryptoPanicSentimentProvider(ISentimentProvider):
     """
     CryptoPanic API client (SRP: Only handles CryptoPanic integration)
-    Dependencies injected via constructor (DIP)
+    
+    OCP: Constructor accepts config dict → new params = no signature change
     """
     
-    def __init__(self, api_key: Optional[str] = None, cache_service=None):
-        self.api_key = api_key or os.getenv("CRYPTOPANIC_API_KEY", "9993cd1826da97d855ee019eadf92a71de388063")
-        self.cache = cache_service
+    def __init__(self, config: dict):
+        """
+        Args:
+            config: {
+                'api_key': Optional API key (fallback to env),
+                'cache_service': ICacheService instance,
+                'cache_ttl': Cache duration in seconds
+            }
+        """
+        self.api_key = config.get('api_key') or os.getenv("CRYPTOPANIC_API_KEY", "9993cd1826da97d855ee019eadf92a71de388063")
+        self.cache = config.get('cache_service')
+        self.cache_ttl = config.get('cache_ttl', 43200)  # Default 12h
         self.base_url = "https://cryptopanic.com/api/developer/v2/posts/"
     
     def get_sentiment(self, symbol: str) -> SentimentData:
@@ -37,8 +50,8 @@ class CryptoPanicSentimentProvider(ISentimentProvider):
         if not HAS_REQUESTS:
             return SentimentData(0, 0, 100, "cryptopanic")
         
-        # Check cache (12-hour cache)
-        cache_key = f"{symbol}_cryptopanic_{int(time.time() / 43200)}"
+        # Check cache (configurable TTL)
+        cache_key = f"{symbol}_cryptopanic_{int(time.time() / self.cache_ttl)}"
         if self.cache:
             cached = self.cache.get(cache_key)
             if cached:
@@ -89,10 +102,20 @@ class CryptoPanicSentimentProvider(ISentimentProvider):
 class BinanceMarketDataProvider(IMarketDataProvider):
     """
     Binance Futures API client (SRP: Only handles Binance data)
+    
+    OCP: Config dict allows adding new params without breaking changes
     """
     
-    def __init__(self, cache_service=None):
-        self.cache = cache_service
+    def __init__(self, config: dict):
+        """
+        Args:
+            config: {
+                'cache_service': ICacheService instance,
+                'cache_ttl': Cache duration (default 7200s = 2h)
+            }
+        """
+        self.cache = config.get('cache_service')
+        self.cache_ttl = config.get('cache_ttl', 7200)
         self.base_url = "https://fapi.binance.com/fapi/v1"
         self.fear_greed_url = "https://api.alternative.me/fng/?limit=1"
     
@@ -101,8 +124,8 @@ class BinanceMarketDataProvider(IMarketDataProvider):
         if not HAS_REQUESTS:
             return {"value": 50, "classification": "Neutral"}
         
-        # 2-hour cache
-        cache_key = f"fear_greed_{int(time.time() / 7200)}"
+        # Configurable cache TTL
+        cache_key = f"fear_greed_{int(time.time() / self.cache_ttl)}"
         if self.cache:
             cached = self.cache.get(cache_key)
             if cached:
@@ -168,10 +191,22 @@ class BinanceMarketDataProvider(IMarketDataProvider):
 
 
 class CoinGeckoSentimentProvider(ISentimentProvider):
-    """CoinGecko API client (SRP)"""
+    """
+    CoinGecko API client (SRP: Only handles CoinGecko integration)
     
-    def __init__(self, cache_service=None):
-        self.cache = cache_service
+    OCP: Config-driven initialization
+    """
+    
+    def __init__(self, config: dict):
+        """
+        Args:
+            config: {
+                'cache_service': ICacheService,
+                'cache_ttl': Cache duration (default 3600s = 1h)
+            }
+        """
+        self.cache = config.get('cache_service')
+        self.cache_ttl = config.get('cache_ttl', 3600)
         self.base_url = "https://api.coingecko.com/api/v3/coins"
     
     def get_sentiment(self, coin_id: str) -> SentimentData:
@@ -179,8 +214,8 @@ class CoinGeckoSentimentProvider(ISentimentProvider):
         if not HAS_REQUESTS:
             return SentimentData(0, 0, 100, "coingecko")
         
-        # 1-hour cache
-        cache_key = f"{coin_id}_coingecko_{int(time.time() / 3600)}"
+        # Configurable cache
+        cache_key = f"{coin_id}_coingecko_{int(time.time() / self.cache_ttl)}"
         if self.cache:
             cached = self.cache.get(cache_key)
             if cached:
@@ -210,3 +245,14 @@ class CoinGeckoSentimentProvider(ISentimentProvider):
         except Exception as e:
             logger.warning(f"CoinGecko error: {e}")
             return SentimentData(0, 0, 100, "coingecko")
+
+
+# ============================================================================
+# AUTO-REGISTRATION (OCP): New providers automatically discoverable
+# ============================================================================
+# No manual registration needed - just add class and it's available via config
+ProviderRegistry.register("CryptoPanicSentimentProvider", CryptoPanicSentimentProvider)
+ProviderRegistry.register("CoinGeckoSentimentProvider", CoinGeckoSentimentProvider)
+ProviderRegistry.register("BinanceMarketDataProvider", BinanceMarketDataProvider)
+
+logger.info(f"✅ API Clients registered: {ProviderRegistry.list_available()}")
