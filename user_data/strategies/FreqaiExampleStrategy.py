@@ -1,16 +1,22 @@
 """
-FreqAI + LightGBM Futures Strategy + CoinGecko Sentiment Filter
-5m timeframe, Binance Futures için optimize edilmiş.
+FreqAI + LightGBM Futures Strategy - SOLID Architecture
+========================================================
+Refactored following SOLID principles:
+- SRP: Each service has single responsibility
+- OCP: Open for extension (new providers via interfaces)
+- LSP: Services interchangeable via interfaces
+- ISP: Segregated interfaces (ISentimentProvider, IMarketDataProvider, etc.)
+- DIP: Depends on abstractions, not concretions (constructor injection)
 
-UYARI: Bu strateji PAPER TRADING içindir.
-Gerçek parayla kullanmadan önce en az 3 ay backtest + 1 ay dry-run yap.
+Architecture:
+    /core          -> Domain interfaces
+    /infrastructure -> API clients (CoinGecko, Binance, CryptoPanic)
+    /application    -> Business logic services (Cointegration, Sentiment)
+    FreqaiExampleStrategy -> Orchestration layer (thin controller)
 """
 import logging
-import os
-import time
-from functools import reduce
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -18,41 +24,45 @@ import talib.abstract as ta
 from pandas import DataFrame
 from technical import qtpylib
 
-try:
-    import requests
-except ImportError:
-    requests = None
-
 from freqtrade.strategy import CategoricalParameter, DecimalParameter, IntParameter, IStrategy, merge_informative_pair
 from freqtrade.persistence import Trade
 
+# Dependency injection container (IoC)
+from .application.service_container import ServiceContainer
 
 logger = logging.getLogger(__name__)
-
-try:
-    from statsmodels.tsa.stattools import coint, adfuller
-    from statsmodels.regression.linear_model import OLS
-    from statsmodels.tools.tools import add_constant
-    HAS_STATSMODELS = True
-except ImportError:
-    HAS_STATSMODELS = False
-    logger.warning("statsmodels not installed. Cointegration features disabled. Install: pip install statsmodels")
 
 
 class FreqaiExampleStrategy(IStrategy):
     """
-    FreqAI LightGBM Regressor Strategy
+    FreqAI LightGBM Strategy - SOLID Architecture
     
-    Bu strateji ML modeli ile fiyat hareketini tahmin eder.
-    &-target değeri: Gelecekteki fiyat değişim yüzdesi
+    This strategy is now a thin orchestration layer (Controller pattern).
+    All business logic delegated to services via dependency injection.
+    
+    Services (injected via IoC container):
+    - CointegrationService: Statistical arbitrage logic
+    - SentimentAggregatorService: Multi-source sentiment analysis
+    - MarketDataProvider: Binance funding rate, Fear & Greed
+    - CacheService: In-memory caching
+    
+    SOLID compliance:
+    - SRP: Strategy only orchestrates, doesn't implement business logic
+    - OCP: New features added via new services, not modifying existing code
+    - DIP: Depends on interfaces (ICointegrationAnalyzer, etc.), not implementations
     """
     
-    # ============================================
-    # OPTIMIZED BY REFERENCE BOOKS:
-    # 1. Trading Exchanges (Market Microstructure)
-    # 2. ML for Algorithmic Trading (Risk Management)
-    # 3. Price Action Trading (Support/Resistance)
-    # ============================================
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        
+        # Dependency injection (IoC container)
+        self._container = ServiceContainer()
+        
+        # Injected services (DIP: depend on abstractions)
+        self._cointegration_service = self._container.cointegration_service
+        self._sentiment_aggregator = self._container.sentiment_aggregator
+        self._market_data_provider = self._container.market_data_provider
+        self._cache_service = self._container.cache_service
     
     # ROI: Fibonacci-based, momentum decay
     # Based on: Price Action candle expansion patterns
@@ -115,35 +125,53 @@ class FreqaiExampleStrategy(IStrategy):
     entry_threshold = DecimalParameter(0.02, 1.5, default=0.06, space="buy", optimize=True)
     exit_threshold = DecimalParameter(-1.5, -0.02, default=-0.06, space="sell", optimize=True)
     
-    # Hyperopt için
+    # Hyperopt parameters
     buy_rsi = IntParameter(20, 40, default=30, space="buy", optimize=True)
     sell_rsi = IntParameter(60, 80, default=70, space="sell", optimize=True)
-    
-    # Sentiment cache (API çağrılarını azaltmak için)
-    # Max 100 key sakla, memory leak önleme
-    sentiment_cache = {}
-    events_cache = {}
-    fear_greed_cache = {}
-    funding_rate_cache = {}
-    _cache_max_size = 50  # Her cache için max key sayısı
-    
-    # Telemetry: Sync check timer (15 dakikada bir)
-    _last_sync_check = None
-    _sync_check_interval = 900  # 15 dakika (saniye)
-    
-    # Telemetry: Model retrain tracking
-    _last_model_accuracy = None
-    _model_retrain_count = 0
-    
-    # ===== QUANT ARBITRAGE INTEGRATION =====
-    # Cointegration pairs cache (pair1_pair2 -> {hedge_ratio, spread_zscore, is_cointegrated})
-    cointegration_cache = {}
-    # Spread history for z-score calculation (pair1_pair2 -> [spread_values])
-    spread_history = {}
-    # Max spread history length (memory efficient)
-    _max_spread_history = 252  # ~1 day @ 5m (252 candles)
 
-    def _clean_old_cache(self, cache_dict: dict, max_size: int = None) -> None:
+    def _get_sentiment_data(self, pair: str) -> dict:
+        """
+        Orchestrates sentiment data retrieval (Delegation to services)
+        SRP: Strategy only coordinates, services do the work
+        """
+        # Determine coin identifier
+        if "BTC" in pair:
+            symbol = "BTC"
+            coin_id = "bitcoin"
+            funding_symbol = "BTCUSDT"
+        elif "ETH" in pair:
+            symbol = "ETH"
+            coin_id = "ethereum"
+            funding_symbol = "ETHUSDT"
+        else:
+            return {
+                'sentiment': {'positive': 0, 'negative': 0, 'neutral': 100},
+                'fear_greed': {'value': 50, 'classification': 'Neutral'},
+                'funding_rate': 0.0
+            }
+        
+        # Cache check (30-min cache for API calls)
+        import time
+        cache_key = f"sentiment_data_{symbol}_{int(time.time() / 1800)}"
+        cached = self._cache_service.get(cache_key)
+        if cached:
+            return cached
+        
+        # Delegate to services (DIP: depend on interfaces, not implementations)
+        sentiment = self._sentiment_aggregator.get_aggregated_sentiment(symbol, coin_id)
+        fear_greed = self._market_data_provider.get_fear_greed_index()
+        funding_rate = self._market_data_provider.get_funding_rate(funding_symbol)
+        
+        result = {
+            'sentiment': sentiment,
+            'fear_greed': fear_greed,
+            'funding_rate': funding_rate
+        }
+        
+        # Cache result
+        self._cache_service.set(cache_key, result)
+        
+        return result
         """Eski cache key'lerini temizle - Memory leak önleme"""
         if max_size is None:
             max_size = self._cache_max_size
@@ -929,8 +957,8 @@ class FreqaiExampleStrategy(IStrategy):
                             btc_close = btc_close[-min_len:]
                             eth_close = eth_close[-min_len:]
                             
-                            # Calculate cointegration
-                            coint_result = self.calculate_cointegration(
+                            # REFACTORED: Use injected service (DIP compliance)
+                            coint_result = self._cointegration_service.calculate_cointegration(
                                 btc_close, eth_close, 'BTC', 'ETH'
                             )
                             
@@ -1079,54 +1107,13 @@ class FreqaiExampleStrategy(IStrategy):
         FreqAI prediction + CoinGecko sentiment + News sentiment + 
         Fear & Greed Index + Funding Rate + klasik RSI filtreleme.
         """
-        # Sentiments kontrol - SADECE ilk çağrıda (cache kullan)
-        # Her candle'da API çağrısı yapma - rate limit!
+        # REFACTORED: Delegate to service method (SRP compliance)
         pair = metadata.get('pair', 'BTC/USDT:USDT')
+        sentiment_data = self._get_sentiment_data(pair)
         
-        # Default değerler
-        sentiment = "neutral"
-        news_sentiment = {"positive": 0, "negative": 0, "neutral": 100}
-        fear_greed = {"value": 50, "classification": "Neutral"}
-        funding_rate = 0.0
-        
-        # API çağrıları - BTC ve ETH için ayrı cache
-        current_hour = int(time.time() / 3600)
-        
-        # Pair'e göre coin_id ve symbol belirle
-        if pair == "BTC/USDT:USDT":
-            coin_id = "bitcoin"
-            symbol = "BTC"
-            funding_symbol = "BTCUSDT"
-        elif pair == "ETH/USDT:USDT":
-            coin_id = "ethereum"
-            symbol = "ETH"
-            funding_symbol = "ETHUSDT"
-        else:
-            coin_id = None
-            symbol = None
-            funding_symbol = None
-        
-        if coin_id:
-            # Cache key kontrolü - 30 dakikada 1 kez çağır (daha güncel)
-            cache_key = f"api_calls_{symbol}_{int(time.time() / 1800)}"
-            if cache_key not in self.sentiment_cache:
-                sentiment = self.get_coingecko_sentiment(coin_id)
-                news_sentiment = self.get_cryptopanic_sentiment(symbol)
-                # Events kaldırıldı - CoinGecko API'de boş dönüyor
-                fear_greed = self.get_fear_greed_index()  # Bu global, her iki coin için aynı
-                funding_rate = self.get_funding_rate(funding_symbol)
-                self.sentiment_cache[cache_key] = {
-                    "sentiment": sentiment, 
-                    "news": news_sentiment, 
-                    "fear_greed": fear_greed,
-                    "funding_rate": funding_rate
-                }
-            else:
-                cached = self.sentiment_cache[cache_key]
-                sentiment = cached.get("sentiment", "neutral")
-                news_sentiment = cached.get("news", {"positive": 0, "negative": 0, "neutral": 100})
-                fear_greed = cached.get("fear_greed", {"value": 50, "classification": "Neutral"})
-                funding_rate = cached.get("funding_rate", 0.0)
+        news_sentiment = sentiment_data.get('sentiment', {'positive': 0, 'negative': 0, 'neutral': 100})
+        fear_greed = sentiment_data.get('fear_greed', {'value': 50, 'classification': 'Neutral'})
+        funding_rate = sentiment_data.get('funding_rate', 0.0)
         
         # Uyarlanabilir entry threshold
         entry_threshold = self.entry_threshold.value
