@@ -53,13 +53,13 @@ class DynamicServiceContainer:
     
     _instance: Optional['DynamicServiceContainer'] = None
     
-    def __new__(cls, config_path: str = None):
+    def __new__(cls, config_path: str = None, enable_hot_reload: bool = False):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
     
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, enable_hot_reload: bool = False):
         if self._initialized:
             return
         
@@ -72,6 +72,7 @@ class DynamicServiceContainer:
                 'providers.yaml'
             )
         
+        self.config_path = config_path
         self.config_loader = ConfigurationLoader(config_path)
         self.config = self.config_loader.load()
         
@@ -83,6 +84,11 @@ class DynamicServiceContainer:
         self._load_market_data_providers()
         self._load_cointegration_service()
         self._load_feature_pipeline()  # NEW: Plugin-based features
+        
+        # Hot-reload watcher (optional - production feature)
+        self._config_watcher = None
+        if enable_hot_reload:
+            self._start_hot_reload()
         
         self._initialized = True
         logger.info("✅ DynamicServiceContainer initialized from config")
@@ -228,11 +234,52 @@ class DynamicServiceContainer:
         """
         return self._feature_pipeline
     
+    def _start_hot_reload(self):
+        """
+        Start hot-reload watcher (production-grade).
+        
+        WARNING: Use with caution in production!
+        - Can cause race conditions during reload
+        - Test thoroughly before enabling
+        - Recommended: Use manual reload_config() instead
+        """
+        try:
+            from application.config_watcher import ConfigWatcher
+            
+            self._config_watcher = ConfigWatcher(
+                config_path=self.config_path,
+                callback=self.reload_config,
+                poll_interval=10.0  # Check every 10s (production-safe)
+            )
+            
+            self._config_watcher.start()
+            logger.info("🔥 Hot-reload ENABLED - config changes auto-applied")
+        
+        except Exception as e:
+            logger.error(f"❌ Hot-reload init failed: {e}")
+            self._config_watcher = None
+    
     def reload_config(self):
-        """Hot-reload configuration (advanced feature)"""
+        """
+        Hot-reload configuration.
+        
+        Thread-Safety: Uses _initialized flag to prevent concurrent reloads.
+        
+        Use cases:
+        1. Manual reload: container.reload_config()
+        2. Auto reload: enable_hot_reload=True
+        3. Emergency disable: Edit YAML, reload instantly
+        """
+        if not self._initialized:
+            logger.warning("⚠️ Reload already in progress")
+            return
+        
+        logger.info("🔄 Reloading configuration...")
+        
         self._initialized = False
-        self.__init__()
-        logger.info("🔄 Configuration reloaded")
+        self.__init__(config_path=self.config_path, enable_hot_reload=False)
+        
+        logger.info("✅ Configuration reloaded successfully")
     
     def get_provider_stats(self) -> dict:
         """
@@ -249,5 +296,16 @@ class DynamicServiceContainer:
             'sentiment_providers': len(self._sentiment_providers),
             'market_data_providers': 1 if self._market_data_provider else 0,
             'cointegration_enabled': self._cointegration_service is not None,
-            'feature_generators': len(self._feature_pipeline.generators) if self._feature_pipeline else 0
+            'feature_generators': len(self._feature_pipeline.generators) if self._feature_pipeline else 0,
+            'hot_reload_enabled': self._config_watcher is not None and self._config_watcher.is_running()
         }
+    
+    def shutdown(self):
+        """
+        Graceful shutdown (stop watcher thread).
+        
+        Call this before app exit to prevent resource leaks.
+        """
+        if self._config_watcher:
+            self._config_watcher.stop()
+            logger.info("✅ Container shutdown complete")
