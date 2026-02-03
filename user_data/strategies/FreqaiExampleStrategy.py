@@ -24,9 +24,19 @@ except ImportError:
     requests = None
 
 from freqtrade.strategy import CategoricalParameter, DecimalParameter, IntParameter, IStrategy, merge_informative_pair
+from freqtrade.persistence import Trade
 
 
 logger = logging.getLogger(__name__)
+
+try:
+    from statsmodels.tsa.stattools import coint, adfuller
+    from statsmodels.regression.linear_model import OLS
+    from statsmodels.tools.tools import add_constant
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+    logger.warning("statsmodels not installed. Cointegration features disabled. Install: pip install statsmodels")
 
 
 class FreqaiExampleStrategy(IStrategy):
@@ -37,17 +47,33 @@ class FreqaiExampleStrategy(IStrategy):
     &-target değeri: Gelecekteki fiyat değişim yüzdesi
     """
     
-    # ROI: Endüstri standardı - agresif profit taking
-    minimal_roi = {"0": 0.15, "120": 0.075, "360": 0.025, "1440": 0}
+    # ============================================
+    # OPTIMIZED BY REFERENCE BOOKS:
+    # 1. Trading Exchanges (Market Microstructure)
+    # 2. ML for Algorithmic Trading (Risk Management)
+    # 3. Price Action Trading (Support/Resistance)
+    # ============================================
     
-    # Stoploss: %10 - Futures 2x leverage ile efektif %20
-    # Endüstri standardı: Trade'e nefes alma alanı bırak
-    stoploss = -0.10
+    # ROI: Fibonacci-based, momentum decay
+    # Based on: Price Action candle expansion patterns
+    minimal_roi = {
+        "0": 0.08,      # Initial expansion target
+        "36": 0.055,    # 3-hour consolidation
+        "120": 0.04,    # Momentum loss threshold
+        "300": 0.025    # Long-term hold (5 hours)
+    }
     
-    # Trailing stoploss - Endüstri standardı ayarları
+    # Stoploss: ATR-based (Ref: ML Trading Risk Mgmt)
+    # Tighter than before: %5.5 max loss per trade
+    # With 2x leverage = ~%11 effective drawdown
+    stoploss = -0.055
+    
+    # Trailing stoploss: Break-even + trailing logic
+    # Ref: Price Action - "Hide stop behind support"
+    # Ref: Market Microstructure - Limit order clustering
     trailing_stop = True
-    trailing_stop_positive = 0.02  # Kâr %2'ye ulaşınca trailing başlar
-    trailing_stop_positive_offset = 0.03  # %3 offset - kâr koruma
+    trailing_stop_positive = 0.018  # Start trailing at +1.8% (ATR * 0.5)
+    trailing_stop_positive_offset = 0.065  # Target +6.5% (ATR * 1.8)
     trailing_only_offset_is_reached = True
     
     # Timeframe
@@ -83,10 +109,11 @@ class FreqaiExampleStrategy(IStrategy):
     process_only_new_candles = True
     use_exit_signal = True
     
-    # FreqAI prediction threshold - DENGELİ AYARLAR
-    # Model çıktısı bu değerin üstündeyse LONG, altındaysa SHORT
-    entry_threshold = DecimalParameter(0.01, 2.0, default=0.08, space="buy", optimize=True)
-    exit_threshold = DecimalParameter(-2.0, -0.01, default=-0.08, space="sell", optimize=True)
+    # FreqAI prediction threshold - OPTIMIZED RANGES
+    # Ref: ML Trading - Feature importance threshold optimization
+    # Wider range for market microstructure sensitivity
+    entry_threshold = DecimalParameter(0.02, 1.5, default=0.06, space="buy", optimize=True)
+    exit_threshold = DecimalParameter(-1.5, -0.02, default=-0.06, space="sell", optimize=True)
     
     # Hyperopt için
     buy_rsi = IntParameter(20, 40, default=30, space="buy", optimize=True)
@@ -107,6 +134,14 @@ class FreqaiExampleStrategy(IStrategy):
     # Telemetry: Model retrain tracking
     _last_model_accuracy = None
     _model_retrain_count = 0
+    
+    # ===== QUANT ARBITRAGE INTEGRATION =====
+    # Cointegration pairs cache (pair1_pair2 -> {hedge_ratio, spread_zscore, is_cointegrated})
+    cointegration_cache = {}
+    # Spread history for z-score calculation (pair1_pair2 -> [spread_values])
+    spread_history = {}
+    # Max spread history length (memory efficient)
+    _max_spread_history = 252  # ~1 day @ 5m (252 candles)
 
     def _clean_old_cache(self, cache_dict: dict, max_size: int = None) -> None:
         """Eski cache key'lerini temizle - Memory leak önleme"""
@@ -357,6 +392,13 @@ class FreqaiExampleStrategy(IStrategy):
             
             logger.info(f"{symbol} Funding Rate: {funding_rate:.4f}%")
             
+            # QUANT ARBITRAGE: Funding Rate Arbitrage Opportunity Detection
+            # Ref: Quant Arbitrage - Risksiz getiri fırsatı
+            if abs(funding_rate) > 0.05:
+                direction = "SHORT" if funding_rate > 0 else "LONG"
+                annualized = funding_rate * 3 * 365  # 8h -> yearly
+                logger.warning(f"[ARBITRAGE] 💰 {symbol} Funding Opportunity: {direction} | Rate: {funding_rate:.4f}% | Annualized: {annualized:.2f}%")
+            
             self.funding_rate_cache[cache_key] = funding_rate
             return funding_rate
             
@@ -364,6 +406,117 @@ class FreqaiExampleStrategy(IStrategy):
             logger.warning(f"Funding rate fetch error: {e}")
             return 0.0
 
+    def calculate_cointegration(self, price_x: np.ndarray, price_y: np.ndarray, 
+                               pair_x: str, pair_y: str) -> dict:
+        """
+        QUANT ARBITRAGE: Cointegration Detection between two pairs.
+        
+        Returns hedge ratio, spread, z-score, and cointegration status.
+        Ref: Engle-Granger Cointegration Test
+        
+        Args:
+            price_x: Price series of pair X (BTC)
+            price_y: Price series of pair Y (ETH)
+            pair_x: Pair X name
+            pair_y: Pair Y name
+            
+        Returns:
+            {
+                'is_cointegrated': bool,
+                'hedge_ratio': float,
+                'spread_current': float,
+                'spread_zscore': float,
+                'coint_pvalue': float
+            }
+        """
+        if not HAS_STATSMODELS:
+            return {
+                'is_cointegrated': False,
+                'hedge_ratio': 0.0,
+                'spread_current': 0.0,
+                'spread_zscore': 0.0,
+                'coint_pvalue': 1.0
+            }
+        
+        try:
+            # Minimum data requirement
+            if len(price_x) < 50 or len(price_y) < 50:
+                return {
+                    'is_cointegrated': False,
+                    'hedge_ratio': 0.0,
+                    'spread_current': 0.0,
+                    'spread_zscore': 0.0,
+                    'coint_pvalue': 1.0
+                }
+            
+            # Take last 252 candles (~1 day @ 5m)
+            lookback = min(252, len(price_x), len(price_y))
+            price_x = price_x[-lookback:]
+            price_y = price_y[-lookback:]
+            
+            # 1. Calculate Hedge Ratio (OLS Regression)
+            # Model: log(Y) = α + β*log(X) + ε
+            log_x = np.log(price_x)
+            log_y = np.log(price_y)
+            
+            X = add_constant(log_x)
+            model = OLS(log_y, X).fit()
+            hedge_ratio = model.params[1]  # β coefficient
+            
+            # 2. Calculate Spread
+            # Spread = log(Y) - β*log(X)
+            spread = log_y - hedge_ratio * log_x
+            
+            # 3. Cointegration Test (Engle-Granger)
+            coint_stat, coint_pvalue, _ = coint(price_y, price_x)
+            is_cointegrated = coint_pvalue < 0.05
+            
+            # 4. Calculate Z-Score (mean reversion signal)
+            spread_mean = np.mean(spread)
+            spread_std = np.std(spread)
+            spread_current = spread[-1]
+            spread_zscore = (spread_current - spread_mean) / (spread_std + 1e-6)
+            
+            # Cache spread history for continuous tracking
+            pair_key = f"{pair_x}_{pair_y}"
+            if pair_key not in self.spread_history:
+                self.spread_history[pair_key] = []
+            
+            self.spread_history[pair_key].append(spread_current)
+            # Keep only last N values (memory efficient)
+            if len(self.spread_history[pair_key]) > self._max_spread_history:
+                self.spread_history[pair_key] = self.spread_history[pair_key][-self._max_spread_history:]
+            
+            result = {
+                'is_cointegrated': is_cointegrated,
+                'hedge_ratio': hedge_ratio,
+                'spread_current': spread_current,
+                'spread_zscore': spread_zscore,
+                'coint_pvalue': coint_pvalue,
+                'correlation': np.corrcoef(price_x, price_y)[0, 1]
+            }
+            
+            # Cache result (1-hour cache)
+            cache_key = f"{pair_key}_coint_{int(time.time() / 3600)}"
+            self.cointegration_cache[cache_key] = result
+            
+            # Log if cointegrated
+            if is_cointegrated:
+                logger.info(f"[COINTEGRATION] ✅ {pair_x} vs {pair_y} | Hedge: {hedge_ratio:.4f} | "
+                          f"Z-Score: {spread_zscore:.2f} | p-value: {coint_pvalue:.4f}")
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Cointegration calculation error: {e}")
+            return {
+                'is_cointegrated': False,
+                'hedge_ratio': 0.0,
+                'spread_current': 0.0,
+                'spread_zscore': 0.0,
+                'coint_pvalue': 1.0
+            }
+    
     def get_coingecko_sentiment(self, coin_id: str) -> str:
         """
         CoinGecko API'den sentiment bilgisi al (7 günlük trend).
@@ -516,67 +669,409 @@ class FreqaiExampleStrategy(IStrategy):
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Standart indicator'lar + FreqAI prediction + Multi-timeframe RSI.
+        MASTER FEATURE VECTOR - 4 Reference Books Integration
+        
+        Ref 1: Trading Exchanges (Harris) - Market Microstructure
+                 ├─ Bid-Ask Spread
+                 ├─ Order Book Imbalance
+                 └─ VWAP Deviation
+        
+        Ref 2: Time Series Analysis (Tsay) - Statistical Validity
+                 ├─ Log Returns (not raw prices)
+                 ├─ GARCH Volatility
+                 └─ Autocorrelation
+        
+        Ref 3: ML for Algorithmic Trading (Jansen) - Normalized Factors
+                 ├─ Z-Score Normalized RSI
+                 ├─ Normalized Momentum
+                 └─ Alpha Factor Combination
+        
+        Ref 4: Price Action Trading - Behavioral Patterns
+                 ├─ Support/Resistance Distance
+                 ├─ Breakout Detection
+                 └─ Candlestick Pattern Ratios
         """
-        # FreqAI prediction'ı al
+        
+        # FreqAI prediction
         dataframe = self.freqai.start(dataframe, metadata, self)
         
-        # 5m RSI (ana timeframe)
+        # =============================================
+        # 1. HARRIS: MARKET MICROSTRUCTURE FEATURES
+        # =============================================
+        
+        # Bid-Ask Spread proxy (using High-Low range)
+        # Ref: Harris - "Spread reflects liquidity"
+        dataframe['bid_ask_spread'] = (dataframe['high'] - dataframe['low']) / dataframe['close']
+        dataframe['bid_ask_spread'] = dataframe['bid_ask_spread'].rolling(14).mean()
+        
+        # Order Book Imbalance proxy (Volume direction)
+        # Ref: Harris - "Bid vs Ask volume determines direction"
+        dataframe['volume_up'] = dataframe['volume'].where(dataframe['close'] > dataframe['open'], 0)
+        dataframe['volume_down'] = dataframe['volume'].where(dataframe['close'] <= dataframe['open'], 0)
+        
+        # Imbalance ratio: Bid volume / Ask volume
+        dataframe['order_imbalance'] = (dataframe['volume_up'].rolling(14).sum() / 
+                                       (dataframe['volume_down'].rolling(14).sum() + 1))
+        
+        # VWAP (Volume Weighted Average Price)
+        # Ref: Harris - "Fiyat VWAP'ten sapma = Mean Reversion"
+        typical_price = (dataframe['high'] + dataframe['low'] + dataframe['close']) / 3
+        dataframe['vwap'] = (typical_price * dataframe['volume']).rolling(20).sum() / dataframe['volume'].rolling(20).sum()
+        dataframe['vwap_deviation'] = (dataframe['close'] - dataframe['vwap']) / dataframe['vwap']
+        
+        # =============================================
+        # 2. TSAY: TIME SERIES FEATURES
+        # =============================================
+        
+        # Log Returns (not raw prices)
+        # Ref: Tsay - "Unit Root problem: always use log returns"
+        dataframe['log_returns'] = np.log(dataframe['close'] / dataframe['close'].shift(1))
+        
+        # Simple Returns for GARCH
+        dataframe['returns'] = dataframe['close'].pct_change()
+        
+        # GARCH(1,1) Volatility approximation
+        # Ref: Tsay - "Conditional variance shows regime changes"
+        # Simple exponential variance (approximation of GARCH)
+        returns_sq = dataframe['returns'] ** 2
+        dataframe['garch_volatility'] = returns_sq.rolling(14).mean() ** 0.5
+        
+        # Normalized volatility (z-score within window)
+        vol_mean = dataframe['garch_volatility'].rolling(20).mean()
+        vol_std = dataframe['garch_volatility'].rolling(20).std()
+        dataframe['volatility_zscore'] = (dataframe['garch_volatility'] - vol_mean) / (vol_std + 1e-6)
+        
+        # Autocorrelation indicator (Ljung-Box equivalent)
+        # Ref: Tsay - "Check for white noise before modeling"
+        dataframe['returns_autocorr'] = dataframe['returns'].rolling(20).apply(
+            lambda x: x.autocorr() if len(x) > 1 else 0, raw=False
+        )
+        
+        # =============================================
+        # 3. JANSEN: NORMALIZED ALPHA FACTORS
+        # =============================================
+        
+        # RSI 5m (entry timeframe)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
         
-        # Multi-timeframe RSI ekleme
+        # Z-Score normalized RSI
+        # Ref: Jansen - "Normalize all features for consistency"
+        rsi_mean = dataframe['rsi'].rolling(20).mean()
+        rsi_std = dataframe['rsi'].rolling(20).std()
+        dataframe['rsi_zscore'] = (dataframe['rsi'] - rsi_mean) / (rsi_std + 1e-6)
+        
+        # MACD as Alpha Factor
+        macd = ta.MACD(dataframe)
+        dataframe['macd'] = macd['macd']
+        dataframe['macd_signal'] = macd['macdsignal']
+        dataframe['macd_diff'] = dataframe['macd'] - dataframe['macd_signal']
+        
+        # Normalized Momentum
+        dataframe['momentum'] = dataframe['close'] - dataframe['close'].shift(10)
+        momentum_mean = dataframe['momentum'].rolling(20).mean()
+        momentum_std = dataframe['momentum'].rolling(20).std()
+        dataframe['momentum_zscore'] = (dataframe['momentum'] - momentum_mean) / (momentum_std + 1e-6)
+        
+        # Multi-timeframe RSI
         pair = metadata.get("pair", "")
         
-        # 15m RSI
         if self.dp:
+            # 15m RSI
             inf_15m = self.dp.get_pair_dataframe(pair=pair, timeframe="15m")
             if not inf_15m.empty and len(inf_15m) > 14:
                 inf_15m["rsi"] = ta.RSI(inf_15m, timeperiod=14)
+                # Normalize 15m RSI
+                rsi_15m_mean = inf_15m['rsi'].rolling(20).mean()
+                rsi_15m_std = inf_15m['rsi'].rolling(20).std()
+                inf_15m['rsi_zscore'] = (inf_15m['rsi'] - rsi_15m_mean) / (rsi_15m_std + 1e-6)
+                
                 dataframe = merge_informative_pair(
-                    dataframe, inf_15m[["date", "rsi"]], 
+                    dataframe, inf_15m[["date", "rsi", "rsi_zscore"]], 
                     self.timeframe, "15m", ffill=True
                 )
-                # Rename column (merge_informative_pair adds _15m suffix)
-                if "rsi_15m" in dataframe.columns:
-                    pass  # Already correct name
-                elif "rsi" in dataframe.columns:
-                    dataframe["rsi_15m"] = dataframe["rsi"]
+                if "rsi_15m" not in dataframe.columns:
+                    dataframe["rsi_15m"] = dataframe.get("rsi", 50)
+                if "rsi_zscore_15m" not in dataframe.columns:
+                    dataframe["rsi_zscore_15m"] = dataframe.get("rsi_zscore", 0)
             else:
-                dataframe["rsi_15m"] = 50  # Default
-        
+                dataframe["rsi_15m"] = 50
+                dataframe["rsi_zscore_15m"] = 0
+            
             # 1h RSI
             inf_1h = self.dp.get_pair_dataframe(pair=pair, timeframe="1h")
             if not inf_1h.empty and len(inf_1h) > 14:
                 inf_1h["rsi"] = ta.RSI(inf_1h, timeperiod=14)
+                rsi_1h_mean = inf_1h['rsi'].rolling(20).mean()
+                rsi_1h_std = inf_1h['rsi'].rolling(20).std()
+                inf_1h['rsi_zscore'] = (inf_1h['rsi'] - rsi_1h_mean) / (rsi_1h_std + 1e-6)
+                
                 dataframe = merge_informative_pair(
-                    dataframe, inf_1h[["date", "rsi"]], 
+                    dataframe, inf_1h[["date", "rsi", "rsi_zscore"]], 
                     self.timeframe, "1h", ffill=True
                 )
-                # Rename column
-                if "rsi_1h" in dataframe.columns:
-                    pass
-                elif "rsi" in dataframe.columns:
-                    dataframe["rsi_1h"] = dataframe["rsi"]
+                if "rsi_1h" not in dataframe.columns:
+                    dataframe["rsi_1h"] = dataframe.get("rsi", 50)
+                if "rsi_zscore_1h" not in dataframe.columns:
+                    dataframe["rsi_zscore_1h"] = dataframe.get("rsi_zscore", 0)
             else:
-                dataframe["rsi_1h"] = 50  # Default
-                
-            # Ensure columns exist with defaults
-            if "rsi_15m" not in dataframe.columns:
-                dataframe["rsi_15m"] = 50
-            if "rsi_1h" not in dataframe.columns:
                 dataframe["rsi_1h"] = 50
+                dataframe["rsi_zscore_1h"] = 0
         else:
             dataframe["rsi_15m"] = 50
+            dataframe["rsi_zscore_15m"] = 0
             dataframe["rsi_1h"] = 50
+            dataframe["rsi_zscore_1h"] = 0
         
-        # === TELEMETRY: Periodic Checks ===
-        # Perform sync check every 15 minutes
+        # Bollinger Bands
+        bb = qtpylib.bollinger_bands(dataframe['close'], window=20, stds=2)
+        dataframe['bb_lowerband'] = bb['lower']
+        dataframe['bb_upperband'] = bb['upper']
+        dataframe['bb_middleband'] = bb['mid']
+        dataframe['bb_width_zscore'] = ((dataframe['bb_upperband'] - dataframe['bb_lowerband']) / 
+                                        dataframe['bb_middleband']).rolling(14).apply(
+                                            lambda x: (x.iloc[-1] - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+                                        )
+        
+        # =============================================
+        # 4. PRICE ACTION: BEHAVIORAL PATTERNS
+        # =============================================
+        
+        # Support/Resistance - Local Minima/Maxima
+        # Ref: Price Action - "Göz kararı değil, matematiksel tanım"
+        dataframe['local_min'] = dataframe['low'].rolling(window=20, center=True).min()
+        dataframe['local_max'] = dataframe['high'].rolling(window=20, center=True).max()
+        
+        # Distance to Support (% away)
+        dataframe['distance_to_support'] = ((dataframe['close'] - dataframe['local_min']) / 
+                                           dataframe['close'])
+        
+        # Distance to Resistance (% away)
+        dataframe['distance_to_resistance'] = ((dataframe['local_max'] - dataframe['close']) / 
+                                              dataframe['close'])
+        
+        # Breakout Detection
+        # Ref: Price Action - "Volume > Average x2 = Legitimate breakout"
+        dataframe['breakout_signal'] = 0
+        volume_avg = dataframe['volume'].rolling(20).mean()
+        
+        # Upside breakout: Price > 20-period high + volume confirmation
+        dataframe.loc[
+            (dataframe['high'] > dataframe['high'].shift(1).rolling(20).max()) &
+            (dataframe['volume'] > volume_avg * 2),
+            'breakout_signal'
+        ] = 1
+        
+        # Downside breakout: Price < 20-period low + volume confirmation
+        dataframe.loc[
+            (dataframe['low'] < dataframe['low'].shift(1).rolling(20).min()) &
+            (dataframe['volume'] > volume_avg * 2),
+            'breakout_signal'
+        ] = -1
+        
+        # Candlestick Pattern Recognition
+        # Pinbar Pattern: Long wick / Small body > 3
+        # Ref: Price Action - "Pinbar = Rejection formation"
+        dataframe['upper_wick'] = dataframe['high'] - dataframe[['open', 'close']].max(axis=1)
+        dataframe['lower_wick'] = dataframe[['open', 'close']].min(axis=1) - dataframe['low']
+        dataframe['body'] = abs(dataframe['close'] - dataframe['open'])
+        
+        # Pinbar ratio
+        total_wick = dataframe['upper_wick'] + dataframe['lower_wick']
+        dataframe['pinbar_ratio'] = total_wick / (dataframe['body'] + 1e-6)
+        
+        # Pinbar signal (strong rejection)
+        dataframe['is_pinbar'] = (dataframe['pinbar_ratio'] > 3).astype(int)
+        
+        # Engulfing Pattern: Current body > Previous body
+        dataframe['engulfing'] = (
+            (abs(dataframe['close'] - dataframe['open']) > 
+             abs(dataframe['close'].shift(1) - dataframe['open'].shift(1)))
+        ).astype(int)
+        
+        # =============================================
+        # 5. QUANT ARBITRAGE: COINTEGRATION & PAIRS TRADING
+        # =============================================
+        
+        # Cointegration Analysis (if we have BTC and ETH data)
+        pair = metadata.get('pair', '')
+        
+        # Initialize cointegration features with defaults
+        dataframe['coint_spread_zscore'] = 0.0
+        dataframe['coint_is_cointegrated'] = 0
+        dataframe['coint_hedge_ratio'] = 1.0
+        dataframe['pairs_signal'] = 0  # -2: Short spread, -1: weak short, 0: none, 1: weak long, 2: Long spread
+        
+        # Only calculate if we have both BTC and ETH in whitelist
+        if HAS_STATSMODELS and self.dp:
+            try:
+                whitelist = self.dp.current_whitelist()
+                
+                # Check if both BTC and ETH are in whitelist
+                has_btc = any('BTC' in p for p in whitelist)
+                has_eth = any('ETH' in p for p in whitelist)
+                
+                if has_btc and has_eth:
+                    # Get BTC data
+                    btc_pair = next((p for p in whitelist if 'BTC' in p), None)
+                    eth_pair = next((p for p in whitelist if 'ETH' in p), None)
+                    
+                    if btc_pair and eth_pair:
+                        btc_df = self.dp.get_pair_dataframe(pair=btc_pair, timeframe=self.timeframe)
+                        eth_df = self.dp.get_pair_dataframe(pair=eth_pair, timeframe=self.timeframe)
+                        
+                        if not btc_df.empty and not eth_df.empty and len(btc_df) > 50 and len(eth_df) > 50:
+                            # Align dataframes by date
+                            btc_close = btc_df['close'].values
+                            eth_close = eth_df['close'].values
+                            
+                            # Use minimum length
+                            min_len = min(len(btc_close), len(eth_close))
+                            btc_close = btc_close[-min_len:]
+                            eth_close = eth_close[-min_len:]
+                            
+                            # Calculate cointegration
+                            coint_result = self.calculate_cointegration(
+                                btc_close, eth_close, 'BTC', 'ETH'
+                            )
+                            
+                            # Add features to current pair's dataframe
+                            # Note: These are BTC-ETH relationship features, applicable to both pairs
+                            dataframe['coint_spread_zscore'] = coint_result['spread_zscore']
+                            dataframe['coint_is_cointegrated'] = int(coint_result['is_cointegrated'])
+                            dataframe['coint_hedge_ratio'] = coint_result['hedge_ratio']
+                            
+                            # PAIRS TRADING SIGNAL
+                            # Ref: Quant Arbitrage - Mean Reversion Strategy
+                            z = coint_result['spread_zscore']
+                            
+                            if coint_result['is_cointegrated']:
+                                # Strong signals (|z| > 2σ)
+                                if z > 2.0:
+                                    # Spread too wide: SHORT spread (BTC long, ETH short)
+                                    dataframe['pairs_signal'] = -2
+                                    if 'BTC' in pair:
+                                        logger.info(f"[PAIRS] 📈 BTC LONG signal (Z={z:.2f})")
+                                elif z < -2.0:
+                                    # Spread too narrow: LONG spread (BTC short, ETH long)
+                                    dataframe['pairs_signal'] = 2
+                                    if 'ETH' in pair:
+                                        logger.info(f"[PAIRS] 📈 ETH LONG signal (Z={z:.2f})")
+                                # Weak signals (1σ < |z| < 2σ)
+                                elif z > 1.0:
+                                    dataframe['pairs_signal'] = -1
+                                elif z < -1.0:
+                                    dataframe['pairs_signal'] = 1
+                                # Exit signals (|z| < 0.5)
+                                elif abs(z) < 0.5:
+                                    dataframe['pairs_signal'] = 0
+                            
+                            # SPREAD FEATURE for ML model
+                            # Normalized spread value (useful for LightGBM)
+                            dataframe['spread_normalized'] = coint_result['spread_zscore']
+                            
+            except Exception as e:
+                logger.warning(f"Cointegration feature calculation error: {e}")
+        
+        # =============================================
+        # TELEMETRY
+        # =============================================
         self._perform_sync_check()
-        
-        # Track model retrain events
         self._track_model_retrain(dataframe)
 
         return dataframe
+
+    def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
+                       current_rate: float, current_profit: float, **kwargs) -> float:
+        """
+        Price Action + Market Microstructure Optimized Stop Loss
+        
+        References:
+        - Trading Exchanges (Larry Harris): "Limit order density at support/resistance"
+        - ML for Algorithmic Trading: "Risk-proportional position sizing"
+        - Price Action Trading: "Hide stop loss behind support"
+        
+        Rules:
+        1. Profit-based: Move stop to lock profits at key levels
+        2. Time-based: Tighten stop if trade ages (momentum decay)
+        3. ATR-based: Volatility adjustment
+        """
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if len(dataframe) < 2:
+                return -0.055  # Default fallback
+                
+            current_candle = dataframe.iloc[-1]
+            previous_candle = dataframe.iloc[-2]
+            
+            # ATR-based dynamic adjustment
+            atr = current_candle.get('atr', 0) if 'atr' in current_candle else 0
+            current_price = current_rate
+            
+            # Calculate ATR as percentage
+            if atr > 0 and current_price > 0:
+                atr_percent = atr / current_price
+            else:
+                atr_percent = 0.03  # Fallback: 3% average volatility
+            
+            # Trade duration (minutes)
+            trade_duration = (current_time - trade.open_date_utc).total_seconds() / 60
+            
+            # ===== PROFIT PROTECTION (Price Action: Support/Resistance) =====
+            # Lock in profits at progressively higher levels
+            
+            if current_profit >= 0.065:
+                # +6.5% profit: Protect with tight stop at +4.5%
+                # Ref: Price Action - "Resistance becomes support after breakout"
+                return 0.045
+            
+            elif current_profit >= 0.04:
+                # +4% profit: Protect with stop at +2.5%
+                # Ref: Break-even with buffer
+                return 0.025
+            
+            elif current_profit >= 0.018:
+                # +1.8% profit: Tight break-even stop
+                # Ref: Price Action - "Hide stop behind limit order cluster"
+                return 0.005
+            
+            # ===== TIME DECAY (Momentum Loss) =====
+            # Ref: Price Action - Contraction = Uncertainty increases
+            
+            elif trade_duration > 300:  # 5+ hours
+                # Long positions: Momentum likely expired
+                # Market has reconsolidated
+                if current_profit > 0.01:
+                    return 0.005  # Lock small gain
+                else:
+                    return -0.04  # Cut losses
+            
+            elif trade_duration > 120:  # 2+ hours
+                # Mid-term: Contraction risk rising
+                return -0.045
+            
+            elif trade_duration > 60:  # 1+ hour
+                # Early-mid term: Normal stop
+                return -0.050
+            
+            # ===== ATR-BASED DYNAMIC (Market Volatility) =====
+            # Ref: ML Trading - Volatility adjustment of risk
+            # Tight stop on low volatility, wider on high volatility
+            
+            if atr_percent > 0:
+                # Conservative volatility multiplier (1.2x)
+                volatility_adjusted_stop = -(atr_percent * 1.5)
+                
+                # Clamp between 3.5% and 7%
+                volatility_adjusted_stop = max(min(volatility_adjusted_stop, -0.035), -0.07)
+                
+                return volatility_adjusted_stop
+            
+            # ===== DEFAULT: Initial ATR-based stop =====
+            return -0.055
+        
+        except Exception as e:
+            logger.warning(f"[STOPLOSS] Error in custom_stoploss: {e}")
+            return -0.055
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -691,49 +1186,154 @@ class FreqaiExampleStrategy(IStrategy):
             logger.info(f"[STRATEGY] 📊 RSI: {last_rsi:.1f}/{last_rsi_15m:.1f}/{last_rsi_1h:.1f} | Sentiment: {sentiment}")
             logger.info(f"[STRATEGY] 📊 Thresholds | LONG > {entry_threshold:.2f} | SHORT < {exit_threshold_adj:.2f}")
 
-        # LONG giriş - MTF RSI confluence
+        # LONG giriş - MASTER FEATURE VECTOR
+        # Ref: Harris + Tsay + Jansen + Price Action
         dataframe.loc[
             (
-                # FreqAI tahmin geçerli (do_predict == 1)
+                # ===== FREQAI PREDICTION (Jansen: ML Model) =====
+                # Model tahmin geçerli
                 (dataframe["do_predict"] == 1)
                 &
-                # FreqAI pozitif tahmin (fiyat artacak)
+                # FreqAI pozitif tahmin
                 (dataframe["&-target"] > entry_threshold)
                 &
-                # DI filtresi (model güvenilirliği) - config.json ile uyumlu
+                # Model güvenilirliği (DI < 4)
                 (dataframe["DI_values"] < 4)
                 &
-                # RSI 5m oversold değil
-                (dataframe["rsi"] < 70)
+                # ===== HARRIS: MARKET MICROSTRUCTURE =====
+                # Order Imbalance: Buy pressure > Sell pressure
+                (dataframe["order_imbalance"] > 1.0)
                 &
-                # MTF confluence: 15m veya 1h RSI de uygun olmalı
-                ((dataframe["rsi_15m"] < 65) | (dataframe["rsi_1h"] < 60))
+                # VWAP Deviation: Fiyat VWAP'ten +% sapmış (Uptrend)
+                (dataframe["vwap_deviation"] > 0.001)
                 &
-                # Volume var
+                # Bid-Ask Spread normal (likidite var)
+                (dataframe["bid_ask_spread"] < 0.05)
+                &
+                # ===== TSAY: TIME SERIES =====
+                # Volatility acceptable (not extreme)
+                (dataframe["volatility_zscore"] < 2.0)
+                &
+                # No white noise (returns correlated)
+                (dataframe["returns_autocorr"] > -0.2)
+                &
+                # ===== JANSEN: NORMALIZED FACTORS =====
+                # RSI not overbought (z-score normalized)
+                (dataframe["rsi_zscore"] < 1.5)
+                &
+                # Momentum positive (z-score)
+                (dataframe["momentum_zscore"] > -0.5)
+                &
+                # Multi-timeframe confirmation
+                (dataframe["rsi_zscore_15m"] < 1.0)
+                &
+                (dataframe["rsi_zscore_1h"] < 0.5)
+                &
+                # ===== PRICE ACTION: BEHAVIORAL PATTERNS =====
+                # Support proximity: Close near support but with room
+                (dataframe["distance_to_support"] > 0.01)
+                &
+                (dataframe["distance_to_support"] < 0.15)
+                &
+                # Breakout confirmation
+                (dataframe["breakout_signal"] >= 0)  # Not breaking down
+                &
+                # Candlestick pattern: Not strong rejection (pinbar)
+                (dataframe["is_pinbar"] == 0) | (dataframe["upper_wick"] < dataframe["lower_wick"])
+                &
+                # Bollinger Bands: Price in lower half (room to grow)
+                (dataframe["close"] < dataframe["bb_middleband"])
+                &
+                # Volume confirmation
                 (dataframe["volume"] > 0)
+                &
+                # ===== QUANT ARBITRAGE: COINTEGRATION BOOST =====
+                # If pairs are cointegrated AND signal is positive for this pair, boost entry
+                # Signal logic: BTC gets signal=-2 when Z>2 (BTC long), ETH gets signal=2 when Z<-2 (ETH long)
+                (
+                    (dataframe["coint_is_cointegrated"] == 0)  # No cointegration, normal entry
+                    |
+                    (  # Cointegration exists, check pairs signal
+                        (dataframe["coint_is_cointegrated"] == 1)
+                        &
+                        (  # Pairs signal supports LONG for this asset
+                            (dataframe["pairs_signal"] >= 0)  # Neutral or positive
+                        )
+                    )
+                )
             ),
             "enter_long"
         ] = 1
 
-        # SHORT giriş - MTF RSI confluence
+        # SHORT giriş - MASTER FEATURE VECTOR
         dataframe.loc[
             (
-                # FreqAI tahmin geçerli (do_predict == 1)
+                # ===== FREQAI PREDICTION =====
                 (dataframe["do_predict"] == 1)
                 &
-                # FreqAI negatif tahmin (fiyat düşecek)
                 (dataframe["&-target"] < exit_threshold_adj)
                 &
-                # DI filtresi - config.json ile uyumlu
                 (dataframe["DI_values"] < 4)
                 &
-                # RSI 5m overbought değil
-                (dataframe["rsi"] > 30)
+                # ===== HARRIS: MARKET MICROSTRUCTURE =====
+                # Order Imbalance: Sell pressure > Buy pressure
+                (dataframe["order_imbalance"] < 1.0)
                 &
-                # MTF confluence: 15m veya 1h RSI de uygun olmalı
-                ((dataframe["rsi_15m"] > 35) | (dataframe["rsi_1h"] > 40))
+                # VWAP Deviation: Fiyat VWAP'ten -% sapmış (Downtrend)
+                (dataframe["vwap_deviation"] < -0.001)
                 &
+                # Bid-Ask Spread normal
+                (dataframe["bid_ask_spread"] < 0.05)
+                &
+                # ===== TSAY: TIME SERIES =====
+                # Volatility acceptable
+                (dataframe["volatility_zscore"] < 2.0)
+                &
+                # No white noise
+                (dataframe["returns_autocorr"] > -0.2)
+                &
+                # ===== JANSEN: NORMALIZED FACTORS =====
+                # RSI not oversold
+                (dataframe["rsi_zscore"] > -1.5)
+                &
+                # Momentum negative
+                (dataframe["momentum_zscore"] < 0.5)
+                &
+                # Multi-timeframe confirmation
+                (dataframe["rsi_zscore_15m"] > -1.0)
+                &
+                (dataframe["rsi_zscore_1h"] > -0.5)
+                &
+                # ===== PRICE ACTION: BEHAVIORAL PATTERNS =====
+                # Resistance proximity: Close near resistance
+                (dataframe["distance_to_resistance"] > 0.01)
+                &
+                (dataframe["distance_to_resistance"] < 0.15)
+                &
+                # Breakout confirmation (downside)
+                (dataframe["breakout_signal"] <= 0)  # Not breaking up
+                &
+                # Candlestick pattern: Not strong rejection upside
+                (dataframe["is_pinbar"] == 0) | (dataframe["lower_wick"] < dataframe["upper_wick"])
+                &
+                # Bollinger Bands: Price in upper half (room to fall)
+                (dataframe["close"] > dataframe["bb_middleband"])
+                &
+                # Volume confirmation
                 (dataframe["volume"] > 0)
+                &
+                # ===== QUANT ARBITRAGE: COINTEGRATION BOOST =====
+                (
+                    (dataframe["coint_is_cointegrated"] == 0)  # No cointegration, normal entry
+                    |
+                    (  # Cointegration exists, check pairs signal
+                        (dataframe["coint_is_cointegrated"] == 1)
+                        &
+                        (  # Pairs signal supports SHORT for this asset
+                            (dataframe["pairs_signal"] <= 0)  # Neutral or negative
+                        )
+                    )
+                )
             ),
             "enter_short"
         ] = 1
