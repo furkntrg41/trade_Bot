@@ -4,7 +4,11 @@ Infrastructure - Cache Service
 In-memory cache implementation (LSP compliance)
 """
 from typing import Dict, Optional
-from ..core.interfaces import ICacheService
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.interfaces import ICacheService
 
 
 class InMemoryCacheService(ICacheService):

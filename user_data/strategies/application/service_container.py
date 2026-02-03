@@ -4,21 +4,24 @@ Application Layer - Service Container (IoC Container Pattern)
 Dependency injection container (SOLID compliance)
 """
 from typing import Optional
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ..core.interfaces import (
+from core.interfaces import (
     ISentimentProvider, 
     IMarketDataProvider, 
     ICointegrationAnalyzer,
     ICacheService
 )
-from ..infrastructure.api_clients import (
+from infrastructure.api_clients import (
     CryptoPanicSentimentProvider,
     CoinGeckoSentimentProvider,
     BinanceMarketDataProvider
 )
-from ..infrastructure.cache_service import InMemoryCacheService
-from ..application.cointegration_service import CointegrationService
-from ..application.sentiment_service import SentimentAggregatorService
+from infrastructure.cache_service import InMemoryCacheService
+from application.cointegration_service import CointegrationService
+from application.sentiment_service import SentimentAggregatorService
 
 
 class ServiceContainer:

@@ -6,8 +6,11 @@ Business logic for statistical arbitrage (SRP)
 import logging
 import numpy as np
 from typing import Dict, Optional
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ..core.interfaces import ICointegrationAnalyzer
+from core.interfaces import ICointegrationAnalyzer
 
 logger = logging.getLogger(__name__)
 

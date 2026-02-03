@@ -5,7 +5,11 @@ Orchestrates multiple sentiment providers (OCP compliance)
 """
 import logging
 from typing import List, Dict
-from ..core.interfaces import ISentimentProvider, SentimentData
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.interfaces import ISentimentProvider, SentimentData
 
 logger = logging.getLogger(__name__)
 

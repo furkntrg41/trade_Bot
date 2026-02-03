@@ -32,7 +32,12 @@ from freqtrade.persistence import Trade
 logger = logging.getLogger(__name__)
 
 # Dependency injection container (IoC)
-from .application.service_container import ServiceContainer
+# Use absolute imports for FreqTrade compatibility
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from application.service_container import ServiceContainer
 
 # Statsmodels availability check
 try:

@@ -7,8 +7,10 @@ import logging
 import time
 from typing import Dict, Optional
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ..core.interfaces import ISentimentProvider, IMarketDataProvider, SentimentData
+from core.interfaces import ISentimentProvider, IMarketDataProvider, SentimentData
 
 logger = logging.getLogger(__name__)
 
