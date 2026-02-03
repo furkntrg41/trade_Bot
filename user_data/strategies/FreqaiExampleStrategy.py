@@ -15,6 +15,7 @@ Architecture:
     FreqaiExampleStrategy -> Orchestration layer (thin controller)
 """
 import logging
+import time
 from typing import Optional
 from datetime import datetime
 
@@ -27,10 +28,20 @@ from technical import qtpylib
 from freqtrade.strategy import CategoricalParameter, DecimalParameter, IntParameter, IStrategy, merge_informative_pair
 from freqtrade.persistence import Trade
 
+# Logger first (for import-time usage)
+logger = logging.getLogger(__name__)
+
 # Dependency injection container (IoC)
 from .application.service_container import ServiceContainer
 
-logger = logging.getLogger(__name__)
+# Statsmodels availability check
+try:
+    from statsmodels.tsa.stattools import coint
+    from statsmodels.api import OLS, add_constant
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+    logger.warning("statsmodels not available - cointegration features disabled")
 
 
 class FreqaiExampleStrategy(IStrategy):
@@ -172,406 +183,6 @@ class FreqaiExampleStrategy(IStrategy):
         self._cache_service.set(cache_key, result)
         
         return result
-        """Eski cache key'lerini temizle - Memory leak önleme"""
-        if max_size is None:
-            max_size = self._cache_max_size
-        if len(cache_dict) > max_size:
-            # En eski key'leri sil (ilk eklenenler)
-            keys_to_remove = list(cache_dict.keys())[:-max_size//2]
-            for key in keys_to_remove:
-                del cache_dict[key]
-            logger.debug(f"Cache cleaned: removed {len(keys_to_remove)} old entries")
-    
-    def _perform_sync_check(self) -> None:
-        """
-        TELEMETRY: Every 15 minutes, verify in-memory state matches Binance reality
-        Logs [SAFETY] - Sync Verified: OK or MISMATCH
-        """
-        now = datetime.now()
-        
-        # Check if 15 minutes passed since last check
-        if self._last_sync_check is None or (now - self._last_sync_check).total_seconds() >= self._sync_check_interval:
-            try:
-                # Get current open trades from FreqTrade
-                if hasattr(self, 'dp') and self.dp:
-                    open_trades = self.dp.current_whitelist()  # Simplified check
-                    
-                    # In production, you'd query Binance API here to compare
-                    # For now, we just log that sync check happened
-                    logger.info(f"[SAFETY] 🔒 Sync Check: In-memory positions verified. Status: OK")
-                    self._last_sync_check = now
-            except Exception as e:
-                logger.warning(f"[SAFETY] ⚠️ Sync Check Failed: {str(e)}")
-    
-    def _track_model_retrain(self, dataframe: DataFrame) -> None:
-        """
-        TELEMETRY: Track model retrain events and accuracy changes
-        Logs [MODEL] - Retrain Complete. Accuracy Delta: +X%
-        """
-        try:
-            # Check if model has prediction column (indicates active FreqAI)
-            if "&-target" in dataframe.columns and len(dataframe) > 0:
-                # Calculate current "accuracy proxy" from DI values (lower = better)
-                # DI < 2 = excellent, DI < 4 = good, DI > 4 = poor
-                current_di_avg = dataframe["DI_values"].tail(100).mean() if "DI_values" in dataframe.columns else 5.0
-                current_accuracy_proxy = max(0, min(100, 100 - (current_di_avg * 10)))
-                
-                # Compare with previous accuracy
-                if self._last_model_accuracy is not None:
-                    delta = current_accuracy_proxy - self._last_model_accuracy
-                    
-                    # Only log if significant change (indicates retrain happened)
-                    if abs(delta) > 1.0:  # > 1% change
-                        self._model_retrain_count += 1
-                        logger.info(f"[MODEL] 🤖 Retrain #{self._model_retrain_count} Complete. Accuracy Proxy: {current_accuracy_proxy:.1f}% (Δ {delta:+.2f}%)")
-                
-                # Update last accuracy
-                self._last_model_accuracy = current_accuracy_proxy
-        except Exception as e:
-            logger.debug(f"Model retrain tracking error: {str(e)}")
-
-    def _get_coingecko_data(self, coin_id: str) -> dict:
-        """
-        CoinGecko API'den tüm veriyi al (tek istek ile hem sentiment hem events).
-        Rate limit tasarrufu için birleştirilmiş metod.
-        """
-        try:
-            if requests is None:
-                return {}
-            
-            cache_key = f"{coin_id}_coingecko_{int(time.time() / 3600)}"
-            if cache_key in self.events_cache:
-                return self.events_cache[cache_key]
-            
-            # Cache temizle
-            self._clean_old_cache(self.events_cache)
-            
-            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&community_data=true"
-            resp = requests.get(url, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            self.events_cache[cache_key] = data
-            return data
-            
-        except Exception as e:
-            logger.warning(f"CoinGecko fetch error for {coin_id}: {e}")
-            return {}
-
-    def get_coingecko_events(self, coin_id: str) -> dict:
-        """
-        CoinGecko'dan yaklaşan etkinlikleri al (7 gün içinde).
-        """
-        try:
-            data = self._get_coingecko_data(coin_id)
-            if not data:
-                return {"has_event": False, "impact": "neutral"}
-            
-            # Etkinlik kontrolü - upcoming events var mı
-            events = data.get("events", [])
-            has_event = len(events) > 0
-            
-            if has_event:
-                event_name = events[0].get("title", "Unknown")
-                logger.info(f"{coin_id} upcoming event: {event_name}")
-                return {"has_event": True, "impact": "positive", "name": event_name}
-            
-            return {"has_event": False, "impact": "neutral"}
-            
-        except Exception as e:
-            logger.warning(f"Events fetch error for {coin_id}: {e}")
-            return {"has_event": False, "impact": "neutral"}
-    
-    def get_cryptopanic_sentiment(self, coin_id: str = "BTC") -> dict:
-        """
-        Cryptopanic'ten son 24 saat haber sentiment'i al.
-        Developer Plan: 100 req/ay - 12 saatlik cache kullan
-        """
-        try:
-            if requests is None:
-                return {"positive": 0, "negative": 0, "neutral": 100}
-            
-            # 12 saatlik cache (100 req/ay limitini aşmamak için: 2 coin × 2/gün × 30 = 120 ama bazı günler daha az)
-            # Güvenli hesap: 2 × 2 × 30 = 120, buffer ile ~90 istek/ay
-            cache_key = f"{coin_id}_cryptopanic_{int(time.time() / 43200)}"
-            if cache_key in self.sentiment_cache:
-                return self.sentiment_cache[cache_key]
-            
-            # Cache temizle
-            self._clean_old_cache(self.sentiment_cache)
-            
-            # CryptoPanic API - Environment variable'dan al
-            api_key = os.environ.get("CRYPTOPANIC_API_KEY", "9993cd1826da97d855ee019eadf92a71de388063")
-            url = f"https://cryptopanic.com/api/developer/v2/posts/?auth_token={api_key}&currencies={coin_id}&filter=hot&public=true"
-            
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            # Sentiment analizi
-            positive = 0
-            negative = 0
-            neutral = 0
-            
-            results = data.get("results", [])[:10]  # Son 10 haber
-            for post in results:
-                votes = post.get("votes", {})
-                positive += votes.get("positive", 0)
-                negative += votes.get("negative", 0)
-                # Sentiment field varsa kullan
-                sent = post.get("sentiment")
-                if sent == "positive":
-                    positive += 1
-                elif sent == "negative":
-                    negative += 1
-                else:
-                    neutral += 1
-            
-            total = positive + negative + neutral
-            if total == 0:
-                total = 1
-            
-            result = {
-                "positive": round(positive / total * 100),
-                "negative": round(negative / total * 100),
-                "neutral": round(neutral / total * 100),
-                "news_count": len(results)
-            }
-            
-            logger.info(f"{coin_id} news sentiment: +{result['positive']}% / -{result['negative']}% ({result['news_count']} news)")
-            
-            self.sentiment_cache[cache_key] = result
-            return result
-            
-        except Exception as e:
-            logger.warning(f"Cryptopanic sentiment error: {e}")
-            return {"positive": 0, "negative": 0, "neutral": 100}
-
-    def get_fear_greed_index(self) -> dict:
-        """
-        Fear & Greed Index al (alternative.me - ücretsiz).
-        0-25: Extreme Fear (alım fırsatı)
-        25-45: Fear
-        45-55: Neutral
-        55-75: Greed
-        75-100: Extreme Greed (satış fırsatı)
-        """
-        try:
-            if requests is None:
-                return {"value": 50, "classification": "Neutral"}
-            
-            # 2 saatlik cache (günde 12 istek - daha güncel veri)
-            cache_key = f"fear_greed_{int(time.time() / 7200)}"
-            if cache_key in self.fear_greed_cache:
-                return self.fear_greed_cache[cache_key]
-            
-            # Cache temizle
-            self._clean_old_cache(self.fear_greed_cache)
-            
-            url = "https://api.alternative.me/fng/?limit=1"
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            fng_data = data.get("data", [{}])[0]
-            value = int(fng_data.get("value", 50))
-            classification = fng_data.get("value_classification", "Neutral")
-            
-            result = {"value": value, "classification": classification}
-            
-            logger.info(f"Fear & Greed Index: {value} ({classification})")
-            
-            self.fear_greed_cache[cache_key] = result
-            return result
-            
-        except Exception as e:
-            logger.warning(f"Fear & Greed fetch error: {e}")
-            return {"value": 50, "classification": "Neutral"}
-
-    def get_funding_rate(self, symbol: str = "BTCUSDT") -> float:
-        """
-        Binance Futures Funding Rate al.
-        Pozitif = Longlar ödüyor (çok fazla long var, short fırsatı)
-        Negatif = Shortlar ödüyor (çok fazla short var, long fırsatı)
-        Normal aralık: -0.01% ile +0.01%
-        Extreme: > 0.05% veya < -0.05%
-        """
-        try:
-            if requests is None:
-                return 0.0
-            
-            # 30 dakikalık cache (funding 8 saatte bir güncellenir ama daha sık kontrol)
-            cache_key = f"funding_{symbol}_{int(time.time() / 1800)}"
-            if cache_key in self.funding_rate_cache:
-                return self.funding_rate_cache[cache_key]
-            
-            # Cache temizle
-            self._clean_old_cache(self.funding_rate_cache)
-            
-            url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            if data and len(data) > 0:
-                funding_rate = float(data[0].get("fundingRate", 0)) * 100  # Yüzde olarak
-            else:
-                funding_rate = 0.0
-            
-            logger.info(f"{symbol} Funding Rate: {funding_rate:.4f}%")
-            
-            # QUANT ARBITRAGE: Funding Rate Arbitrage Opportunity Detection
-            # Ref: Quant Arbitrage - Risksiz getiri fırsatı
-            if abs(funding_rate) > 0.05:
-                direction = "SHORT" if funding_rate > 0 else "LONG"
-                annualized = funding_rate * 3 * 365  # 8h -> yearly
-                logger.warning(f"[ARBITRAGE] 💰 {symbol} Funding Opportunity: {direction} | Rate: {funding_rate:.4f}% | Annualized: {annualized:.2f}%")
-            
-            self.funding_rate_cache[cache_key] = funding_rate
-            return funding_rate
-            
-        except Exception as e:
-            logger.warning(f"Funding rate fetch error: {e}")
-            return 0.0
-
-    def calculate_cointegration(self, price_x: np.ndarray, price_y: np.ndarray, 
-                               pair_x: str, pair_y: str) -> dict:
-        """
-        QUANT ARBITRAGE: Cointegration Detection between two pairs.
-        
-        Returns hedge ratio, spread, z-score, and cointegration status.
-        Ref: Engle-Granger Cointegration Test
-        
-        Args:
-            price_x: Price series of pair X (BTC)
-            price_y: Price series of pair Y (ETH)
-            pair_x: Pair X name
-            pair_y: Pair Y name
-            
-        Returns:
-            {
-                'is_cointegrated': bool,
-                'hedge_ratio': float,
-                'spread_current': float,
-                'spread_zscore': float,
-                'coint_pvalue': float
-            }
-        """
-        if not HAS_STATSMODELS:
-            return {
-                'is_cointegrated': False,
-                'hedge_ratio': 0.0,
-                'spread_current': 0.0,
-                'spread_zscore': 0.0,
-                'coint_pvalue': 1.0
-            }
-        
-        try:
-            # Minimum data requirement
-            if len(price_x) < 50 or len(price_y) < 50:
-                return {
-                    'is_cointegrated': False,
-                    'hedge_ratio': 0.0,
-                    'spread_current': 0.0,
-                    'spread_zscore': 0.0,
-                    'coint_pvalue': 1.0
-                }
-            
-            # Take last 252 candles (~1 day @ 5m)
-            lookback = min(252, len(price_x), len(price_y))
-            price_x = price_x[-lookback:]
-            price_y = price_y[-lookback:]
-            
-            # 1. Calculate Hedge Ratio (OLS Regression)
-            # Model: log(Y) = α + β*log(X) + ε
-            log_x = np.log(price_x)
-            log_y = np.log(price_y)
-            
-            X = add_constant(log_x)
-            model = OLS(log_y, X).fit()
-            hedge_ratio = model.params[1]  # β coefficient
-            
-            # 2. Calculate Spread
-            # Spread = log(Y) - β*log(X)
-            spread = log_y - hedge_ratio * log_x
-            
-            # 3. Cointegration Test (Engle-Granger)
-            coint_stat, coint_pvalue, _ = coint(price_y, price_x)
-            is_cointegrated = coint_pvalue < 0.05
-            
-            # 4. Calculate Z-Score (mean reversion signal)
-            spread_mean = np.mean(spread)
-            spread_std = np.std(spread)
-            spread_current = spread[-1]
-            spread_zscore = (spread_current - spread_mean) / (spread_std + 1e-6)
-            
-            # Cache spread history for continuous tracking
-            pair_key = f"{pair_x}_{pair_y}"
-            if pair_key not in self.spread_history:
-                self.spread_history[pair_key] = []
-            
-            self.spread_history[pair_key].append(spread_current)
-            # Keep only last N values (memory efficient)
-            if len(self.spread_history[pair_key]) > self._max_spread_history:
-                self.spread_history[pair_key] = self.spread_history[pair_key][-self._max_spread_history:]
-            
-            result = {
-                'is_cointegrated': is_cointegrated,
-                'hedge_ratio': hedge_ratio,
-                'spread_current': spread_current,
-                'spread_zscore': spread_zscore,
-                'coint_pvalue': coint_pvalue,
-                'correlation': np.corrcoef(price_x, price_y)[0, 1]
-            }
-            
-            # Cache result (1-hour cache)
-            cache_key = f"{pair_key}_coint_{int(time.time() / 3600)}"
-            self.cointegration_cache[cache_key] = result
-            
-            # Log if cointegrated
-            if is_cointegrated:
-                logger.info(f"[COINTEGRATION] ✅ {pair_x} vs {pair_y} | Hedge: {hedge_ratio:.4f} | "
-                          f"Z-Score: {spread_zscore:.2f} | p-value: {coint_pvalue:.4f}")
-            
-            return result
-            
-        except Exception as e:
-            logger.warning(f"Cointegration calculation error: {e}")
-            return {
-                'is_cointegrated': False,
-                'hedge_ratio': 0.0,
-                'spread_current': 0.0,
-                'spread_zscore': 0.0,
-                'coint_pvalue': 1.0
-            }
-    
-    def get_coingecko_sentiment(self, coin_id: str) -> str:
-        """
-        CoinGecko API'den sentiment bilgisi al (7 günlük trend).
-        coin_id: 'bitcoin' veya 'ethereum'
-        """
-        try:
-            # Birleştirilmiş CoinGecko verisini kullan (rate limit tasarrufu)
-            data = self._get_coingecko_data(coin_id)
-            if not data:
-                return "neutral"
-            
-            # Price change 7 gün içinde
-            price_change_7d = data.get("market_data", {}).get("price_change_percentage_7d", 0)
-            
-            if price_change_7d > 5:
-                sentiment = "positive"
-            elif price_change_7d < -5:
-                sentiment = "negative"
-            else:
-                sentiment = "neutral"
-            
-            logger.info(f"{coin_id} sentiment: {sentiment} (7d: {price_change_7d:.2f}%)")
-            return sentiment
-            
-        except Exception as e:
-            logger.warning(f"Sentiment fetch error for {coin_id}: {e}")
-            return "neutral"
 
     def feature_engineering_expand_all(
         self, dataframe: DataFrame, period: int, metadata: dict, **kwargs
@@ -1112,6 +723,7 @@ class FreqaiExampleStrategy(IStrategy):
         sentiment_data = self._get_sentiment_data(pair)
         
         news_sentiment = sentiment_data.get('sentiment', {'positive': 0, 'negative': 0, 'neutral': 100})
+        sentiment_summary = sentiment_data.get('sentiment_label', 'neutral')  # For logging
         fear_greed = sentiment_data.get('fear_greed', {'value': 50, 'classification': 'Neutral'})
         funding_rate = sentiment_data.get('funding_rate', 0.0)
         
@@ -1170,7 +782,7 @@ class FreqaiExampleStrategy(IStrategy):
             coint_health_proxy = "STRONG" if last_di < 2 else "MODERATE" if last_di < 4 else "WEAK"
             
             logger.info(f"[STRATEGY] 📊 {pair} | Pred: {last_pred:.4f} | Confidence: {confidence_score:.1f}% | Coint: {coint_health_proxy} | do_predict: {last_do_predict}")
-            logger.info(f"[STRATEGY] 📊 RSI: {last_rsi:.1f}/{last_rsi_15m:.1f}/{last_rsi_1h:.1f} | Sentiment: {sentiment}")
+            logger.info(f"[STRATEGY] 📊 RSI: {last_rsi:.1f}/{last_rsi_15m:.1f}/{last_rsi_1h:.1f} | Sentiment: {sentiment_summary}")
             logger.info(f"[STRATEGY] 📊 Thresholds | LONG > {entry_threshold:.2f} | SHORT < {exit_threshold_adj:.2f}")
 
         # LONG giriş - MASTER FEATURE VECTOR
