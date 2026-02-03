@@ -29,6 +29,8 @@ from core.provider_registry import ProviderRegistry
 
 # Register all available providers (auto-discovery)
 from infrastructure import api_clients  # Triggers auto-registration
+from infrastructure import feature_generators  # Register feature generators
+from application import cointegration_algorithms  # Register algorithms
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ class DynamicServiceContainer:
         self._load_sentiment_providers()
         self._load_market_data_providers()
         self._load_cointegration_service()
+        self._load_feature_pipeline()  # NEW: Plugin-based features
         
         self._initialized = True
         logger.info("✅ DynamicServiceContainer initialized from config")
@@ -156,6 +159,31 @@ class DynamicServiceContainer:
             logger.error(f"❌ Cointegration service init failed: {e}")
             self._cointegration_service = None
     
+    def _load_feature_pipeline(self):
+        """
+        Load feature generators from config (OCP).
+        
+        Benefits:
+        - Add new features: Edit YAML, no code change
+        - A/B test features: Toggle enabled flag
+        - Feature importance: See config for active features
+        """
+        try:
+            from core.feature_interfaces import FeaturePipeline
+            
+            generators = self.config_loader.instantiate_providers(
+                category='feature_generators',
+                registry=ProviderRegistry,
+                additional_deps={}  # Feature generators don't need cache
+            )
+            
+            self._feature_pipeline = FeaturePipeline(generators)
+            logger.info(f"✅ Feature pipeline: {len(generators)} generators loaded")
+        
+        except Exception as e:
+            logger.error(f"❌ Feature pipeline init failed: {e}")
+            self._feature_pipeline = None
+    
     # =============================================================================
     # PUBLIC API (Property Getters for Dependency Injection)
     # =============================================================================
@@ -185,6 +213,21 @@ class DynamicServiceContainer:
         """Get cointegration service"""
         return self._cointegration_service
     
+    @property
+    def feature_pipeline(self):
+        """
+        Get feature engineering pipeline (OCP: Add generators via config).
+        
+        Usage in strategy:
+            df = self._container.feature_pipeline.execute(df, metadata)
+        
+        Benefits:
+        - All features generated in one call
+        - Error handling per generator
+        - Performance tracking
+        """
+        return self._feature_pipeline
+    
     def reload_config(self):
         """Hot-reload configuration (advanced feature)"""
         self._initialized = False
@@ -205,5 +248,6 @@ class DynamicServiceContainer:
         return {
             'sentiment_providers': len(self._sentiment_providers),
             'market_data_providers': 1 if self._market_data_provider else 0,
-            'cointegration_enabled': self._cointegration_service is not None
+            'cointegration_enabled': self._cointegration_service is not None,
+            'feature_generators': len(self._feature_pipeline.generators) if self._feature_pipeline else 0
         }

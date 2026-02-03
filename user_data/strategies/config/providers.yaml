@@ -44,3 +44,33 @@ cointegration_algorithms:
     enabled: false
     config:
       lookback_period: 252
+
+# =============================================================================
+# FEATURE ENGINEERING PIPELINE (OCP: Add features via config)
+# =============================================================================
+feature_generators:
+  - name: "momentum"
+    class: "MomentumFeatureGenerator"
+    enabled: true
+    config:
+      rsi_periods: [14, 50]
+  
+  - name: "volatility"
+    class: "VolatilityFeatureGenerator"
+    enabled: true
+    config:
+      bb_period: 20
+      bb_std: 2.0
+      atr_period: 14
+  
+  - name: "trend"
+    class: "TrendFeatureGenerator"
+    enabled: true
+    config:
+      ema_periods: [9, 21, 50, 200]
+  
+  - name: "volume"
+    class: "VolumeFeatureGenerator"
+    enabled: true
+    config:
+      volume_ma_period: 20
